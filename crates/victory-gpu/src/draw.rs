@@ -685,17 +685,17 @@ impl State {
             }
             for (views, kind) in [(&stage.root_cbvs, 0), (&stage.root_srvs, 1), (&stage.root_uavs, 2)] {
                 for &(slot, param) in views {
-                    let blocks = slot == victory_shader::emit::VIEW_BLOCKS;
-                    if kind == 1 && (blocks || slot == victory_shader::emit::VIEW_STRIDES) {
-                        // The bound view heap's stride table, or its block
+                    let slots = slot == victory_shader::emit::VIEW_SLOTS;
+                    if kind == 1 && (slots || slot == victory_shader::emit::VIEW_STRIDES) {
+                        // The bound view heap's stride table, or its slot
                         // table; without one the shader would read an
                         // unbound root view.
                         let heap = (self.heaps[0] != 0)
                             .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                             .flatten();
-                        let table = heap.and_then(|h| if blocks { h.blocks() } else { h.strides() });
+                        let table = heap.and_then(|h| if slots { h.slots() } else { h.strides() });
                         let Some(table) = table else {
-                            once!("a shader reads view strides or blocks without a view heap: dropped");
+                            once!("a shader reads view strides or slots without a view heap: dropped");
                             not_run("view strides without a view heap");
                             return false;
                         };
@@ -1143,10 +1143,10 @@ impl State {
         }
         // Tables whose slots the host heap does not hold in one run are
         // made afresh: those reaching past a host heap smaller than the
-        // title's, and where the host holds the title's slots by blocks
-        // (its limit, 1,000,000 views on NVIDIA) those reaching into a
-        // block without host slots or across blocks that lie apart. A
-        // table the host holds elsewhere than the title is read there.
+        // title's. (Where the host caps its view heaps, 1,000,000 views on
+        // NVIDIA, shaders find each entry through the view-slot table:
+        // every table is read where the title has it.) A table the host
+        // holds elsewhere than the title is read there.
         let mut made = Vec::new();
         for (slot, table, first, last) in spans {
             let Some(heap) = self.heap_of(table) else {

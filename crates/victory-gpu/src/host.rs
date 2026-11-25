@@ -229,10 +229,6 @@ fn create() -> windows::core::Result<Host> {
         let shader_host = victory_shader::emit::host::Host {
             device: device.clone(),
         };
-        // Translated shaders index view heaps of `HEAP_VIEWS` slots unless
-        // the host makes none that large (NVIDIA): said before the first
-        // translation (`crate::shader_cache`) and the first heap.
-        crate::descriptor::host::host_views(shader_host.view_heap_limit());
         match shader_host.fuses_fmad() {
             Ok(true) => {}
             Ok(false) => tracing::warn!(
@@ -240,6 +236,12 @@ fn create() -> windows::core::Result<Host> {
             ),
             Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
         }
+        // Translated shaders index view heaps of `HEAP_VIEWS` slots unless
+        // the host makes none that large (NVIDIA): said before the first
+        // translation (`crate::shader_cache`) and the first heap, but after
+        // the probe above, which binds no view-slot table (translated for a
+        // capped heap, its table entry would be looked up there).
+        crate::descriptor::host::host_views(shader_host.view_heap_limit());
         Ok(Host {
             device,
             queue,

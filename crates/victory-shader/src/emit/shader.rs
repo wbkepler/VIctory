@@ -17,16 +17,12 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// the buffer view at view-heap index `i`, and in its top bits
 /// ([`VIEW_SKIP_SHIFT`]) the bytes the host's view starts before it.
 pub const VIEW_STRIDES: u8 = 255;
-/// The root SRV slot of the host's view-block table, in [`ROOT_CBV_SPACE`]:
-/// read only by shaders translated for a host that holds the title's view
-/// slots by blocks ([`set_view_heap`]). Its dword `b` is the heap index of
-/// the first of the title's slots `b << VIEW_BLOCK_SHIFT ..`, for every `b`
-/// below [`HEAP_VIEWS`]` >> VIEW_BLOCK_SHIFT`.
-pub const VIEW_BLOCKS: u8 = 254;
-/// Title view slots come in blocks of `1 << VIEW_BLOCK_SHIFT` on such a
-/// host: a block's slots follow each other in the host's heap, in the
-/// title's order, wherever the block lies.
-pub const VIEW_BLOCK_SHIFT: u32 = 10;
+/// The root SRV slot of the host's view-slot table, in [`ROOT_CBV_SPACE`]:
+/// read only by shaders translated for a host whose view heaps hold the
+/// title's views wherever a slot was free ([`set_view_heap`]). Its dword
+/// `i` is the heap index of the view the title's slot `i` holds (of a null
+/// view for a slot without one), for every `i` below [`HEAP_VIEWS`].
+pub const VIEW_SLOTS: u8 = 254;
 /// Where a view-stride table dword keeps the bytes (0, 4, 8 or 12) the
 /// host's raw view of a structured buffer view starts before the view's
 /// first byte; the stride is in the bits below. A raw view starts on 16
@@ -49,7 +45,8 @@ pub const HEAP_VIEWS: u32 = 1 << 21;
 pub const HEAP_SAMPLERS: u32 = 2048;
 
 /// What translations assume of the host's view heaps: their slots, and
-/// whether they hold the title's slots by blocks ([`set_view_heap`]).
+/// whether the title's slots lead to them through the view-slot table
+/// ([`set_view_heap`]).
 static VIEW_HEAP: [std::sync::atomic::AtomicU32; 2] = [
     std::sync::atomic::AtomicU32::new(HEAP_VIEWS),
     std::sync::atomic::AtomicU32::new(0),
@@ -78,11 +75,12 @@ pub fn heap_views() -> u32 {
     view_heap().0
 }
 
-/// Whether the host's view heaps hold the title's slots by blocks: an
-/// index a shader takes from the resource heap itself is the title's, and
-/// goes through the view-block table ([`VIEW_BLOCKS`]) to the host's.
-/// False unless the host said otherwise ([`set_view_heap`]).
-pub fn view_blocks() -> bool {
+/// Whether the host's view heaps hold the title's views wherever a slot
+/// was free: a view heap index a shader computes (from the resource heap
+/// itself or through a table) is the title's, and goes through the
+/// view-slot table ([`VIEW_SLOTS`]) to the host's. False unless the host
+/// said otherwise ([`set_view_heap`]).
+pub fn view_slots() -> bool {
     view_heap().1
 }
 
@@ -91,14 +89,15 @@ pub fn view_blocks() -> bool {
 /// undefined there, a removed device in practice): every view heap has
 /// `views` slots, the last three null as below. Such a heap has no room for
 /// every slot of a title heap that large beside the host's own, so with
-/// `blocks` it holds the title's slots by blocks, each wherever it fits
-/// ([`VIEW_BLOCKS`]). Set before the first translation. The values are part
+/// `slots` it holds each distinct view of the title's once, wherever a slot
+/// was free, and the title's slots lead there through a table
+/// ([`VIEW_SLOTS`]). Set before the first translation. The values are part
 /// of the translation, so a shader cache must key on them (`victory-gpu`'s
 /// does).
-pub fn set_view_heap(views: u32, blocks: bool) {
+pub fn set_view_heap(views: u32, slots: bool) {
     let relaxed = std::sync::atomic::Ordering::Relaxed;
     VIEW_HEAP[0].store(views.clamp(4, HEAP_VIEWS), relaxed);
-    VIEW_HEAP[1].store(u32::from(blocks), relaxed);
+    VIEW_HEAP[1].store(u32::from(slots), relaxed);
 }
 
 /// The heap index of the host's null raw buffer view (the null raw

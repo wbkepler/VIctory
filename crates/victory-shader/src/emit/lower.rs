@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, VIEW_BLOCK_SHIFT, VIEW_BLOCKS, VIEW_SKIP_SHIFT, VIEW_STRIDES, flags};
+use super::shader::{Shader, VIEW_SKIP_SHIFT, VIEW_SLOTS, VIEW_STRIDES, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{
@@ -5848,31 +5848,26 @@ impl<'a> Lower<'a> {
 
     /// The host's heap index for the view heap index `index` that a load
     /// of a descriptor from a root parameter of type `root` gives, computed
-    /// in the current block. The same index, except for a descriptor from
-    /// the resource heap itself on a host whose view heaps hold the title's
-    /// slots by blocks (module notes, "Heap indices"): there the index is
-    /// the title's, and the host's is the view-block table's entry for its
-    /// block (root SRV [`VIEW_BLOCKS`]) plus the index within the block. A
-    /// table's slots are the host's already: the host passes where the
-    /// table lies.
+    /// in the current block. The same index, except on a host whose view
+    /// heaps hold the title's views wherever a slot was free (module notes,
+    /// "Heap indices"): there the index is the title's, from the resource
+    /// heap itself or through a table (the host passes where the title has
+    /// the table), and the host's is the view-slot table's entry for it
+    /// (root SRV [`VIEW_SLOTS`]).
     fn host_index(&mut self, root: Option<RootType>, index: V, sampler: bool) -> V {
-        if sampler || root != Some(RootType::ResourceHeap) || !super::view_blocks() {
+        let views = matches!(root, Some(RootType::ResourceHeap | RootType::Table));
+        if sampler || !views || !super::view_slots() {
             return index;
         }
         let c = self.cur;
-        // The table has an entry for each block below `HEAP_VIEWS`.
+        // The table has an entry for each index below `HEAP_VIEWS`.
         let last = self.s.m.i32(super::HEAP_VIEWS - 1);
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         let index = self.s.m.select(c, over, last, index);
-        let shift = self.s.m.i32(VIEW_BLOCK_SHIFT);
-        let block = self.s.m.bin(c, Bin::LShr, index, shift);
         let two = self.s.m.i32(2);
-        let at = self.s.m.bin(c, Bin::Shl, block, two);
-        let table = self.s.root_srv_handle(VIEW_BLOCKS);
-        let first = self.raw_dword(table, at);
-        let within = self.s.m.i32((1 << VIEW_BLOCK_SHIFT) - 1);
-        let within = self.s.m.bin(c, Bin::And, index, within);
-        self.s.m.bin(c, Bin::Add, first, within)
+        let at = self.s.m.bin(c, Bin::Shl, index, two);
+        let table = self.s.root_srv_handle(VIEW_SLOTS);
+        self.raw_dword(table, at)
     }
 
     /// Whether a descriptor comes from the resource heap itself (root type
