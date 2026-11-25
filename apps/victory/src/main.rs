@@ -121,6 +121,10 @@ enum Command {
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
+        /// Override the frame-rate limit in FPS (0 = uncapped; overrides
+        /// VICTORY_FPS_LIMIT and [graphics].fps_limit).
+        #[arg(long)]
+        fps: Option<u32>,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -190,9 +194,10 @@ fn main() -> Result<()> {
             strict,
             execute,
             console,
+            fps,
             title_args: _,
         } => {
-            let code = run::run(&exe, unimplemented, strict, execute, console)?;
+            let code = run::run(&exe, unimplemented, strict, execute, console, fps)?;
             if code != 0 {
                 // Preserve all 32 bits of the Windows process status.
                 std::process::exit(code as i32);
@@ -237,6 +242,15 @@ fn show_config() -> Result<()> {
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
     println!("fidelityfx  : {}", status(&cfg.fidelityfx_dir));
+    println!(
+        "fps_limit   : {}",
+        match cfg.graphics.fps_limit {
+            None => "(title default)".to_owned(),
+            Some(0) => "uncapped".to_owned(),
+            Some(n) => format!("{n} fps"),
+        }
+    );
+    println!("tearing     : {}", cfg.graphics.allow_tearing);
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }

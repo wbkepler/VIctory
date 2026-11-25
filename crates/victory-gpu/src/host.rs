@@ -2418,7 +2418,35 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
-const BUFFERS: u32 = 2;
+const BUFFERS: u32 = 3;
+
+/// Whether windowed flip-model presentation may enable DXGI tearing when the
+/// host adapter and display support `DXGI_FEATURE_PRESENT_ALLOW_TEARING`.
+static ALLOW_TEARING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Configures whether windowed flip-model presentation may use DXGI tearing
+/// (`DXGI_PRESENT_ALLOW_TEARING`) when supported by the host adapter/OS.
+pub fn set_allow_tearing(allow: bool) {
+    ALLOW_TEARING.store(allow, Ordering::Relaxed);
+}
+
+fn factory_supports_tearing(factory: &IDXGIFactory2) -> bool {
+    let Ok(factory5) = factory.cast::<IDXGIFactory5>() else {
+        return false;
+    };
+    let mut supported = windows::core::BOOL(0);
+    // SAFETY: `supported` is a `BOOL` matching `DXGI_FEATURE_PRESENT_ALLOW_TEARING`.
+    let ok = unsafe {
+        factory5
+            .CheckFeatureSupport(
+                DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                (&raw mut supported).cast(),
+                size_of_val(&supported) as u32,
+            )
+            .is_ok()
+    };
+    ok && supported.as_bool()
+}
 
 #[derive(Default)]
 struct Presentation {
@@ -2453,6 +2481,7 @@ struct Presenter {
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
+    tearing: bool,
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
@@ -2622,16 +2651,16 @@ impl Host {
         }
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
+            let flags = if p.tearing {
+                DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+            } else {
+                DXGI_SWAP_CHAIN_FLAG(0)
+            };
             let resized = retry.attempt(Instant::now(), || {
                 // SAFETY: no back buffer is held; every submission was waited for.
                 unsafe {
-                    p.swap_chain.ResizeBuffers(
-                        BUFFERS,
-                        width,
-                        height,
-                        format,
-                        DXGI_SWAP_CHAIN_FLAG(0),
-                    )
+                    p.swap_chain
+                        .ResizeBuffers(BUFFERS, width, height, format, flags)
                 }
             })?;
             match resized {
@@ -2682,7 +2711,17 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let presented = if p.tearing {
+                let hr = p.swap_chain.Present(0, DXGI_PRESENT_ALLOW_TEARING);
+                if hr.is_err() {
+                    p.swap_chain.Present(0, DXGI_PRESENT(0))
+                } else {
+                    hr
+                }
+            } else {
+                p.swap_chain.Present(0, DXGI_PRESENT(0))
+            };
+            let _ = presented;
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -2705,7 +2744,9 @@ impl Host {
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
                 .map_err(|e| ("DXGI factory", e))?;
-            let desc = DXGI_SWAP_CHAIN_DESC1 {
+            let mut tearing =
+                ALLOW_TEARING.load(Ordering::Relaxed) && factory_supports_tearing(&factory);
+            let mut desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
                 Format: format,
@@ -2716,20 +2757,46 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: if tearing {
+                    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32
+                } else {
+                    0
+                },
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)
-                .and_then(|chain| chain.cast::<IDXGISwapChain3>())
-                .map_err(|e| ("swap chain", e))?;
+            let swap_chain = match factory.CreateSwapChainForHwnd(
+                &self.queue,
+                hwnd,
+                &desc,
+                None,
+                None,
+            ) {
+                Ok(sc) => Ok(sc),
+                Err(_) if tearing => {
+                    tearing = false;
+                    desc.Flags = 0;
+                    factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)
+                }
+                Err(e) => Err(e),
+            }
+            .and_then(|chain| chain.cast::<IDXGISwapChain3>())
+            .map_err(|e| ("swap chain", e))?;
             let copy = self.new_list().map_err(|e| ("copy list", e))?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            tracing::info!(
+                width,
+                height,
+                format = format.0,
+                buffers = BUFFERS,
+                tearing,
+                "presenting to a window"
+            );
             Ok(Presenter {
                 swap_chain,
                 width,
                 height,
                 format,
+                tearing,
                 copy,
                 hwnd,
                 meter: Meter::new(),

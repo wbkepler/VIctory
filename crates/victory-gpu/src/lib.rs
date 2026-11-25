@@ -64,8 +64,9 @@ mod twin;
 #[cfg(windows)]
 mod watch;
 
+pub use frame::set_fps_limit;
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{on_failure, set_allow_tearing};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_remapped,

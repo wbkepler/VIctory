@@ -216,6 +216,7 @@ static FACTORY_FUNCTIONS: Table<32> = {
 /// A display mode as the console lists it: size, refresh rate (numerator,
 /// denominator), format, scanline order, scaling, flags.
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Mode {
     width: u32,
     height: u32,
@@ -227,13 +228,57 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
-/// The console's mode list: one 4K mode at 60 Hz (Grand Theft Auto VI looks
-/// for a 120 Hz one to allow 120 Hz frame intervals).
-/// shortcut: fixed mode, not the host display's; report the host's rates if
-/// a title paces by them.
+/// Standard refresh rates advertised on the console output so titles that
+/// probe for high-refresh display support see 60, 120, 144, and 240 Hz.
+const STANDARD_REFRESH_RATES: &[u32] = &[60, 120, 144, 240];
+
+/// Queries the host primary display's current refresh rate in Hz, if known.
+#[cfg(windows)]
+fn host_refresh_hz() -> Option<u32> {
+    use windows::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
+    let mut dm = DEVMODEW {
+        dmSize: size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    // SAFETY: `dm` has `dmSize` initialized for `EnumDisplaySettingsW`.
+    let ok = unsafe { EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, &mut dm).as_bool() };
+    (ok && dm.dmDisplayFrequency >= 30 && dm.dmDisplayFrequency <= 1000)
+        .then_some(dm.dmDisplayFrequency)
+}
+
+#[cfg(not(windows))]
+fn host_refresh_hz() -> Option<u32> {
+    None
+}
+
+fn build_modes(format: u32, host_hz: Option<u32>) -> Vec<Mode> {
+    let mut rates: Vec<u32> = STANDARD_REFRESH_RATES.to_vec();
+    if let Some(hz) = host_hz
+        && !rates.contains(&hz)
+    {
+        rates.push(hz);
+        rates.sort_unstable();
+    }
+    rates
+        .into_iter()
+        .map(|hz| Mode {
+            width: 3840,
+            height: 2160,
+            refresh: [hz, 1],
+            format,
+            scanlines: 1, // progressive
+            scaling: 0,
+            flags: 0,
+        })
+        .collect()
+}
+
+/// The console's mode list: 4K progressive modes at standard high refresh
+/// rates (60, 120, 144, 240 Hz, plus the host display's current rate if
+/// distinct) so titles checking for high-refresh displays see them.
 extern "system" fn modes(
     _: This,
-    _format: u32,
+    format: u32,
     _flags: u32,
     count: *mut u32,
     out: *mut Mode,
@@ -242,26 +287,23 @@ extern "system" fn modes(
     let Some(count) = (unsafe { count.as_mut() }) else {
         return E_INVALIDARG;
     };
+    let list = build_modes(format, host_refresh_hz());
     if out.is_null() {
-        *count = 1;
+        *count = list.len() as u32;
         return S_OK;
     }
-    if *count < 1 {
-        return MORE_DATA;
+    let capacity = *count as usize;
+    let written = capacity.min(list.len());
+    for (i, mode) in list.iter().take(written).enumerate() {
+        // SAFETY: checked non-null; caller provided room for `capacity` >= `written` modes.
+        unsafe { out.add(i).write(*mode) };
     }
-    *count = 1;
-    let mode = Mode {
-        width: 3840,
-        height: 2160,
-        refresh: [60, 1],
-        format: 0,
-        scanlines: 1, // progressive
-        scaling: 0,
-        flags: 0,
-    };
-    // SAFETY: checked non-null; room for `count` >= 1 modes.
-    unsafe { out.write(mode) };
-    S_OK
+    *count = written as u32;
+    if capacity < list.len() {
+        MORE_DATA
+    } else {
+        S_OK
+    }
 }
 
 /// IUnknown 3, object 4, output 15 (12 as on PC, then 3 console ones).
@@ -337,5 +379,76 @@ mod tests {
             assert_eq!(enumerate(object, 1, &mut out), NOT_FOUND, "{method}");
             assert!(out.is_null(), "{method} left a stale output pointer");
         }
+    }
+
+    #[test]
+    fn output_enumerates_high_refresh_modes() {
+        type GetModes = extern "system" fn(This, u32, u32, *mut u32, *mut Mode) -> HRESULT;
+        let get_modes = slot::<GetModes>(&OUTPUT_OBJECT, 0xa8);
+
+        let mut total = 0u32;
+        assert_eq!(
+            get_modes(&OUTPUT_OBJECT, 28, 0, &mut total, std::ptr::null_mut()),
+            S_OK
+        );
+        assert!(
+            total >= 4,
+            "expected at least 4 standard modes, got {total}"
+        );
+
+        // Undersized buffer gets partial fill and MORE_DATA.
+        let mut small = [Mode {
+            width: 0,
+            height: 0,
+            refresh: [0, 0],
+            format: 0,
+            scanlines: 0,
+            scaling: 0,
+            flags: 0,
+        }; 1];
+        let mut small_count = 1u32;
+        assert_eq!(
+            get_modes(&OUTPUT_OBJECT, 28, 0, &mut small_count, small.as_mut_ptr()),
+            MORE_DATA
+        );
+        assert_eq!(small_count, 1);
+
+        let mut list = vec![small[0]; total as usize];
+        let mut count = total;
+        assert_eq!(
+            get_modes(&OUTPUT_OBJECT, 28, 0, &mut count, list.as_mut_ptr()),
+            S_OK
+        );
+        assert_eq!(count, total);
+        assert_eq!(small[0], list[0]);
+        let rates: Vec<u32> = list.iter().map(|m| m.refresh[0]).collect();
+        for expected in [60, 120, 144, 240] {
+            assert!(
+                rates.contains(&expected),
+                "missing {expected} Hz in {rates:?}"
+            );
+        }
+        assert!(
+            list.iter()
+                .all(|m| (m.width, m.height, m.format) == (3840, 2160, 28))
+        );
+
+        // Deterministic ordering with no host rate, sub-60 Hz host rate, and
+        // custom high-refresh host rate (without duplicates).
+        let standard = build_modes(28, None);
+        assert_eq!(
+            standard.iter().map(|m| m.refresh).collect::<Vec<_>>(),
+            vec![[60, 1], [120, 1], [144, 1], [240, 1]]
+        );
+        let sub60 = build_modes(28, Some(59));
+        assert_eq!(
+            sub60.iter().map(|m| m.refresh[0]).collect::<Vec<_>>(),
+            vec![59, 60, 120, 144, 240]
+        );
+        let custom = build_modes(28, Some(165));
+        let custom_rates: Vec<u32> = custom.iter().map(|m| m.refresh[0]).collect();
+        assert_eq!(custom_rates, vec![60, 120, 144, 165, 240]);
+        let dedup = build_modes(28, Some(120));
+        assert_eq!(dedup.len(), 4);
     }
 }

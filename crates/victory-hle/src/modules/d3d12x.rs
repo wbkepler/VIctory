@@ -36,6 +36,21 @@ fn host_gpu_failed(what: &str) -> ! {
     unreachable!("the process has ended")
 }
 
+/// Overrides the console frame-rate cap (`None` = title default,
+/// `Some(0)` = uncapped, `Some(n)` = cap at `n` FPS).
+pub fn set_fps_limit(limit: Option<u32>) {
+    victory_gpu::set_fps_limit(limit);
+}
+
+/// Sets whether windowed flip-model presentation may use DXGI tearing when
+/// supported by the host adapter and display.
+pub fn set_allow_tearing(allow: bool) {
+    #[cfg(windows)]
+    victory_gpu::set_allow_tearing(allow);
+    #[cfg(not(windows))]
+    let _ = allow;
+}
+
 /// Keeps the host's translations of the title's shaders in `dir` (a
 /// folder of the cache) across runs, and its compiled pipelines beside it
 /// (`pipelines`).

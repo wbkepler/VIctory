@@ -22,3 +22,12 @@ game_dir = 'D:\victory-data\game'
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
+
+# [graphics]
+# Override the title's frame-rate limit in FPS (0 = uncapped).
+# Precedence: --fps > VICTORY_FPS_LIMIT > this setting > title default.
+# fps_limit = 0
+#
+# Allow DXGI flip-model tearing when supported (default: true).
+# env: VICTORY_ALLOW_TEARING
+# allow_tearing = true
