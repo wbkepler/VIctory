@@ -3324,6 +3324,9 @@ fn title_window() -> Option<HWND> {
         }
         true.into()
     }
+    // `EnumWindows` sees only the calling thread's desktop: the one the
+    // title's windows are on.
+    crate::desktop::attach();
     let mut found: Option<HWND> = None;
     // SAFETY: the callback only writes `found`, which outlives the call.
     let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut found as isize)) };
@@ -3771,6 +3774,7 @@ fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     std::thread::Builder::new()
         .name("victory-window".into())
         .spawn(move || {
+            crate::desktop::attach();
             let made = make_window(width, height);
             let ok = made.is_ok();
             let _ = sender.send(made.map(|h| h.0 as usize));

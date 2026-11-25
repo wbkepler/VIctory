@@ -1287,6 +1287,9 @@ mod host {
 
     /// The foreground window is one of ours (the title's or our fallback).
     fn focused() -> bool {
+        // The foreground window and `GetAsyncKeyState` answer only threads
+        // on the interactive desktop, where our windows are.
+        victory_gpu::desktop::attach();
         let mut process = 0;
         // SAFETY: plain queries; a null window gives process 0.
         unsafe {
