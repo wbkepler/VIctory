@@ -50,6 +50,10 @@ title's), so a run finds them under the names it gives them itself.
 Everything except `victory-game` is platform-level and can be tested with
 any Xbox Series title.
 
+How `victory-gpu` gives the host GPU the title's buffers, which on the
+console share one pool of memory with the CPU, is in
+[GPU memory](gpu-memory.md).
+
 ## Import resolution
 
 For every `dll!function` the title imports, in order:

@@ -908,6 +908,24 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
+        // Snapshots of copies in video memory read their mirrors: brought up
+        // to date at once, and kept so until the copy-backs.
+        let snapshots: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = runs
+            .iter()
+            .flat_map(|l| {
+                l.deferred()
+                    .copies
+                    .iter()
+                    .filter_map(|s| match s {
+                        Step::GpuWrite(shadow, address, len, false) => {
+                            Some((shadow.clone(), *address, *len))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        crate::shadow::snapshots_ahead(&snapshots);
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
@@ -1033,6 +1051,10 @@ impl Host {
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
         crate::shadow::copy_back_marks(&withheld);
+        // What shaders wrote into copies in video memory, for the copy-backs
+        // below to read from their mirrors: in the ranges with snapshots
+        // (marked ones compare nothing; `copy_back_marks` pulled their pages).
+        crate::shadow::pull(&snapshots);
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
@@ -1043,6 +1065,7 @@ impl Host {
                 crate::memory::note_withheld(len as u64);
             }
         }
+        crate::shadow::snapshots_done(&snapshots);
         for list in runs {
             for work in &list.deferred().after {
                 work();
@@ -2964,6 +2987,92 @@ impl Host {
             );
             on
         })
+    }
+
+    /// Whether host copies that shaders write go to GPU upload heaps too,
+    /// with a system memory mirror for the CPU (`crate::shadow`):
+    /// `VICTORY_GPU_UPLOAD_WRITES=1` with [`Host::gpu_upload`] on. Asked once.
+    pub(crate) fn gpu_upload_writes(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = self.gpu_upload() && crate::switch::on("VICTORY_GPU_UPLOAD_WRITES");
+            tracing::info!(
+                on,
+                "host copies that shaders write in GPU upload heaps (VICTORY_GPU_UPLOAD_WRITES)"
+            );
+            on
+        })
+    }
+
+    /// Copies `regions` (destination, its offset, source, its offset,
+    /// bytes) between buffers on the GPU, now, and waits: for the GPU's
+    /// writes into copies in video memory to reach their system memory
+    /// mirrors before the CPU reads them (`crate::shadow::pull`). Runs in a
+    /// list of its own after whatever the queue holds; callable from inside
+    /// a submission's copy-back. Buffers start and end in the common state
+    /// (buffers enter and leave the copy states implicitly).
+    pub(crate) fn copy_now(&self, regions: &[(&ID3D12Resource, u64, &ID3D12Resource, u64, u64)]) {
+        if regions.is_empty() {
+            return;
+        }
+        struct Copier {
+            allocator: ID3D12CommandAllocator,
+            list: ID3D12GraphicsCommandList,
+            fence: ID3D12Fence,
+            event: HANDLE,
+            value: u64,
+        }
+        // SAFETY: D3D12 objects are free-threaded; the event is waited on
+        // under the mutex only.
+        unsafe impl Send for Copier {}
+        static COPIER: OnceLock<Option<Mutex<Copier>>> = OnceLock::new();
+        let copier = COPIER.get_or_init(|| {
+            // SAFETY: plain creation; the list is closed until used.
+            let made = unsafe {
+                (|| -> windows::core::Result<Copier> {
+                    let allocator: ID3D12CommandAllocator =
+                        self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                    let list: ID3D12GraphicsCommandList =
+                        self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+                    list.Close()?;
+                    let fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+                    let event = CreateEventW(None, false, false, None)?;
+                    Ok(Copier { allocator, list, fence, event, value: 0 })
+                })()
+            };
+            match made {
+                Ok(c) => Some(Mutex::new(c)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no host copier: copies in video memory are not read back");
+                    None
+                }
+            }
+        });
+        let Some(copier) = copier else {
+            return;
+        };
+        let mut c = copier.lock().unwrap_or_else(|e| e.into_inner());
+        c.value += 1;
+        let value = c.value;
+        // SAFETY: the allocator's last list finished (each call waits); the
+        // buffers are live and their ranges inside them (the caller's).
+        let ran = unsafe {
+            c.allocator.Reset().and_then(|()| {
+                c.list.Reset(&c.allocator, None)?;
+                for &(dst, dst_at, src, src_at, bytes) in regions {
+                    c.list.CopyBufferRegion(dst, dst_at, src, src_at, bytes);
+                }
+                c.list.Close()?;
+                self.queue.ExecuteCommandLists(&[Some(c.list.cast()?)]);
+                self.queue.Signal(&c.fence, value)?;
+                c.fence.SetEventOnCompletion(value, c.event)?;
+                WaitForSingleObject(c.event, INFINITE);
+                Ok(())
+            })
+        };
+        if let Err(e) = ran {
+            tracing::warn!(error = %e, "a host copy did not run");
+        }
     }
 
     fn mapped_buffer(&self, size: u64, upload: bool) -> Option<(ID3D12Resource, *mut u8)> {
