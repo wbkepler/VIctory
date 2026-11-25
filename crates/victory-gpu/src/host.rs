@@ -1794,6 +1794,15 @@ impl HostList {
         Some((buffer, data))
     }
 
+    /// A mapped readback buffer of `size` bytes, alive until the list is
+    /// reset.
+    pub(crate) fn readback(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let (buffer, data) = host.mapped_buffer(size, true)?;
+        name(&buffer, || format!("list readback {size:#x}"));
+        self.deferred().uploads.push(buffer.clone());
+        Some((buffer, data))
+    }
+
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
@@ -2618,8 +2627,14 @@ impl Host {
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.mapped_buffer(size, false)
+    }
+
+    /// A mapped buffer of `size` bytes: upload memory, or (`readback`)
+    /// readback memory in the copy-destination state.
+    fn mapped_buffer(&self, size: u64, readback: bool) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_UPLOAD,
+            Type: if readback { D3D12_HEAP_TYPE_READBACK } else { D3D12_HEAP_TYPE_UPLOAD },
             ..Default::default()
         };
         let desc = D3D12_RESOURCE_DESC {
@@ -2644,7 +2659,7 @@ impl Host {
                     &heap,
                     D3D12_HEAP_FLAG_NONE,
                     &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    if readback { D3D12_RESOURCE_STATE_COPY_DEST } else { D3D12_RESOURCE_STATE_GENERIC_READ },
                     None,
                     &mut buffer,
                 )
@@ -2656,7 +2671,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                tracing::warn!(error = %e, size, "no upload buffer");
+                tracing::warn!(error = %e, size, readback, "no mapped buffer");
                 None
             }
         }
@@ -2916,6 +2931,14 @@ impl Meter {
                 crate::shadow::lazy::log(copy_frames);
                 crate::bindless::log(copy_frames);
                 crate::shadow::log_views(copy_frames);
+                let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
+                if n > 0 {
+                    tracing::info!(
+                        "texture read backs: {:.1}/frame, {:.1} KB/frame",
+                        n as f64 / frames,
+                        bytes as f64 / frames / 1e3
+                    );
+                }
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -3222,7 +3245,7 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        self.mapped_buffer(size, false)
+        self.shared_mapped(size, false)
     }
 
     /// A buffer in video memory that the CPU maps through the PCI BAR (a
@@ -3246,7 +3269,7 @@ impl Host {
             });
             return None;
         }
-        let Some((buffer, data)) = self.mapped_buffer(size, true) else {
+        let Some((buffer, data)) = self.shared_mapped(size, true) else {
             UPLOAD_BYTES.fetch_sub(size, Ordering::Relaxed);
             return None;
         };
@@ -3389,7 +3412,9 @@ impl Host {
         }
     }
 
-    fn mapped_buffer(&self, size: u64, upload: bool) -> Option<(ID3D12Resource, *mut u8)> {
+    /// A mapped buffer shaders may write: system memory (write-back), or
+    /// (`upload`) a GPU upload heap.
+    fn shared_mapped(&self, size: u64, upload: bool) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = if upload {
             D3D12_HEAP_PROPERTIES {
                 Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
