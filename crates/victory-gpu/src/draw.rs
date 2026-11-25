@@ -2520,8 +2520,13 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 
     /// A structured view the title places off its buffer's elements (the
-    /// culling constants at a ring position) is made over a copy of its own
-    /// bytes; one on an element views the buffer's copy.
+    /// culling constants at a ring position), or on an element but not on
+    /// 16 bytes (from marquezinii's review of #1762: element 1 of the
+    /// 456-byte constants), is made raw over its buffer's copy from the 16
+    /// bytes below (astrosteveo's review: a copy of its own bytes missed
+    /// writes through the buffer's view in the same list). A view the host
+    /// leaves structured (a stride of 458 bytes, not whole dwords) and off
+    /// its buffer's elements is made over a copy of its own bytes.
     #[test]
     fn structured_views_off_their_buffers_elements_get_their_own_copy() {
         let Some(host) = crate::host::host() else {
@@ -2541,24 +2546,33 @@ void main(uint3 id : SV_DispatchThreadID) {
         .unwrap();
         // SAFETY: a live heap.
         let at = unsafe { cpu.GetCPUDescriptorHandleForHeapStart() };
-        // Four 456-byte elements placed at `address` (resource and view
-        // descriptions as the title passes them to device 0x230).
-        let view = |address: u64| {
-            let resource: [u32; 14] = [1, 0, 0, 0, 4 * 456, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        // Four elements of `stride` bytes placed at `address` (resource and
+        // view descriptions as the title passes them to device 0x230).
+        let view_of = |stride: u32, address: u64| {
+            let resource: [u32; 14] = [1, 0, 0, 0, 4 * stride, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
             let mut desc = [0u32; 16];
-            desc[..10].copy_from_slice(&[0, 1, 5768, 0, 0, 0, 4, 456, 0, 0]);
+            desc[..10].copy_from_slice(&[0, 1, 5768, 0, 0, 0, 4, stride, 0, 0]);
             (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
             View::Placed(false, resource, desc)
         };
-        let width = |address: u64| {
-            let made = crate::descriptor::host::make_view(&view(address), at).expect("a view");
+        let width = |view: View| {
+            let made = crate::descriptor::host::make_view(&view, at).expect("a view");
             // SAFETY: a live buffer.
             unsafe { made.GetDesc() }.Width
         };
-        assert_eq!(width(start + 456), 1 << 16, "on an element: the buffer's copy");
-        assert_eq!(width(start + 100), (4 * 456u64).next_multiple_of(256), "off: its own bytes");
+        let raw = |address: u64| view_of(456, address);
+        assert_eq!(width(raw(start + 4 * 456)), 1 << 16, "on an element and 16 bytes: the buffer's copy");
+        assert_eq!(width(raw(start + 456)), 1 << 16, "on an element only: the buffer's copy");
+        assert_eq!(width(raw(start + 100)), 1 << 16, "off its elements: the buffer's copy");
+        // Draws refresh the copy the view shows: the buffer's.
+        for address in [start + 456, start + 100] {
+            let (copy, at, len) = crate::descriptor::host::view_copy(&raw(address)).unwrap();
+            assert_eq!((copy.range(), at, len), ((start, 1 << 16), address, 4 * 456), "the buffer's copy");
+        }
+        let view = |address: u64| view_of(458, address);
+        assert_eq!(width(view(start + 100)), (4 * 458u64).next_multiple_of(256), "left structured, off: its own bytes");
         let (copy, address, len) = crate::descriptor::host::view_copy(&view(start + 100)).unwrap();
-        assert_eq!((copy.range(), address, len), ((start + 100, 4 * 456), start + 100, 4 * 456));
+        assert_eq!((copy.range(), address, len), ((start + 100, 4 * 458), start + 100, 4 * 458));
         drop(copy);
         // A slot made from the view holds its copy: after more than a
         // thousand other views' copies, draws still find (and refresh) the
@@ -2572,7 +2586,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         slots.make_at(0, &view(start + 100));
         let shown = std::sync::Arc::downgrade(&crate::descriptor::host::view_copy(&view(start + 100)).unwrap().0);
         for k in 1..1200 {
-            if (100 + 4 * k) % 456 != 0 {
+            if (100 + 4 * k) % 458 != 0 {
                 crate::descriptor::host::view_copy(&view(start + 100 + 4 * k)).unwrap();
             }
         }

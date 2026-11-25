@@ -687,12 +687,12 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let (kept, mark) = make_marked(view, self.cpu(index));
+        let (kept, mark, skip) = make_marked(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
-        self.set_stride(index, Some(view));
+        self.set_stride(index, Some(view), skip);
         self.set_mark(index, mark);
     }
 
@@ -761,7 +761,7 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
-        self.set_stride(index, None);
+        self.set_stride(index, None, 0);
         // Unmarked by host slot: a block given back leaves none behind.
         self.set_mark(index, None);
         // A slot of the title's, where they lie in the title's order.
@@ -771,9 +771,11 @@ impl HostHeap {
     }
 
     /// Enters the byte stride of `view` (0 for none or not a buffer view)
-    /// for slot `index` in the view-stride table.
-    fn set_stride(&self, index: u32, view: Option<&View>) {
-        self.write_stride(index, view.map_or(0, view_stride));
+    /// for slot `index` in the view-stride table, with the bytes the host's
+    /// view starts before it (`skip`, [`raw_window`]) in its top bits.
+    fn set_stride(&self, index: u32, view: Option<&View>, skip: u32) {
+        let stride = view.map_or(0, view_stride);
+        self.write_stride(index, stride | skip << victory_shader::emit::VIEW_SKIP_SHIFT);
     }
 
     fn write_stride(&self, index: u32, stride: u32) {
@@ -987,7 +989,6 @@ impl HostHeap {
             return None;
         };
         if made[slot as usize] != key {
-            self.set_stride(slot, Some(&view));
             self.note_address(slot, Some(&view));
             // Shaders index the heap itself (`crate::bindless`): buffer views
             // are made when written.
@@ -997,13 +998,14 @@ impl HostHeap {
             // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(&view);
             made[slot as usize] = if later { 0 } else { key };
-            let (kept, mark) = if later {
-                (None, None)
+            let (kept, mark, skip) = if later {
+                (None, None, 0)
             } else {
                 make_marked(&view, self.cpu(slot))
             };
             // By host slot, as shaders read it: their heap index is the
             // host's (through the view-block table where there is one).
+            self.set_stride(slot, Some(&view), skip);
             self.set_mark(slot, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(slot));
@@ -1178,8 +1180,36 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 /// reads, [`crate::shadow::for_view`]) and the view's title range.
 pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
     let (address, len) = buffer_range(view)?;
-    let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
+    let (shadow, _) = crate::shadow::for_view(address, len, view_align(view))?;
     Some((shadow, address, len))
+}
+
+/// Where the host copy a buffer view reads starts ([`copy_align`]), as
+/// [`buffer_srv`] and [`buffer_uav`] ask for it, so that draws find and
+/// refresh the copy the slot shows.
+fn view_align(view: &View) -> u64 {
+    let words: Option<(bool, &[u32; 10])> = match view {
+        View::Shader(_, Some(desc)) => Some((false, desc)),
+        View::Unordered(_, _, Some(desc)) => Some((true, desc)),
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => {
+            desc[..10].try_into().ok().map(|w| (*unordered, w))
+        }
+        _ => None,
+    };
+    let element = u64::from(view_stride(view));
+    match words {
+        Some((false, w)) if w[1] == 1 => {
+            let desc = srv_desc(w);
+            // SAFETY: a buffer view's union member.
+            copy_align(desc.Format, unsafe { desc.Anonymous.Buffer }.StructureByteStride, element)
+        }
+        Some((true, w)) if w[1] == 1 => {
+            let desc = uav_desc(w);
+            // SAFETY: a buffer view's union member.
+            copy_align(desc.Format, unsafe { desc.Anonymous.Buffer }.StructureByteStride, element)
+        }
+        _ => element,
+    }
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
@@ -1209,6 +1239,69 @@ type Kept = Option<(ID3D12Resource, Option<std::sync::Arc<crate::shadow::Shadow>
 #[cfg(feature = "diagnostics")]
 static REFUSED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Where a raw view may start in its buffer, in bytes.
+const RAW_ALIGN: u64 = D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT as u64;
+
+/// The stride of a structured buffer view the host makes raw: its
+/// structure stride when it is a whole number of dwords (what translated
+/// shaders read by index), else 0 (left as it is).
+///
+/// Translated shaders read untyped buffers as raw bytes (scalar loads at a
+/// byte address, raw loads at `element * stride + offset`), and indexed
+/// reads of structured buffers through raw handles too. NVIDIA addresses a
+/// structured view by its own stride whatever the read (an RTX 5090 read
+/// zeros at byte 20 of a 16-byte-stride view; a raw read at byte `b` of a
+/// 12-byte view lands at `b / 4 * 12`), so only a raw view reads the same
+/// everywhere. The view-stride table keeps the title's stride. Ported from
+/// fxceless/victory-gta6 (GPL-3.0), commit 578d459c, `raw_window`.
+fn raw_stride(format: DXGI_FORMAT, stride: u32) -> u32 {
+    if format == DXGI_FORMAT_UNKNOWN && stride > 0 && stride.is_multiple_of(4) {
+        stride
+    } else {
+        0
+    }
+}
+
+/// `count` elements of `stride` bytes (a whole number of dwords) from byte
+/// `start` (a dword) of a host copy as a raw view: its first dword, its
+/// dwords, and the bytes it starts before `start`; none for too many
+/// dwords for one view. A raw view starts on 16 bytes
+/// (`D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT`), a console view on any dword
+/// (element 1 of the meshlet culling's 456-byte constants, of 12- and
+/// 24-byte strides): the view starts on the 16 bytes below, in the same
+/// copy, and translated shaders add the bytes skipped, which the
+/// view-stride table keeps (`victory_shader::emit::VIEW_SKIP_SHIFT`). From
+/// astrosteveo's review of #1762: a copy of the view's own bytes did not
+/// see writes made through the buffer's view earlier in the same list, nor
+/// that view its writes.
+fn raw_window(start: u64, count: u32, stride: u32) -> Option<(u64, u32, u32)> {
+    if stride == 0 || !start.is_multiple_of(4) {
+        return None;
+    }
+    let skip = start % RAW_ALIGN;
+    let dwords = (skip + u64::from(count) * u64::from(stride)) / 4;
+    let dwords = u32::try_from(dwords).ok().filter(|&d| d <= 1 << 27)?;
+    Some(((start - skip) / 4, dwords, skip as u32))
+}
+
+/// Where the host copy of a buffer view's bytes must start: on a dword if
+/// the host makes the view raw ([`raw_stride`], [`raw_window`]), else on
+/// one of its elements (`element`). [`crate::shadow::for_view`] makes a
+/// copy of the view's own bytes when its buffer's copy does not start it
+/// there.
+fn copy_align(format: DXGI_FORMAT, stride: u32, element: u64) -> u64 {
+    if raw_stride(format, stride) > 0 { 4 } else { element }
+}
+
+/// Logs a structured view the host leaves structured (a stride that is not
+/// a whole number of dwords, or too many dwords for one raw view): raw
+/// reads of it may read the wrong bytes on NVIDIA.
+fn left_structured(format: DXGI_FORMAT, stride: u32, count: u32) {
+    if format == DXGI_FORMAT_UNKNOWN && stride > 0 {
+        once!(stride, count, "structured buffer view left structured on the host");
+    }
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
@@ -1222,10 +1315,13 @@ fn buffer_srv(
         once!(len, "buffer view of elements without a size");
         return None;
     }
-    // The copy its own bytes are in, its first element counted from there.
+    // The copy its own bytes are in, its first element counted from there
+    // (a structured view made raw: on a dword of it).
     let start = address + buffer.FirstElement * element;
+    let stride = buffer.StructureByteStride;
+    let align = copy_align(desc.Format, stride, element);
     let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
+        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, align)
     else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
@@ -1233,7 +1329,24 @@ fn buffer_srv(
         }
         return None;
     };
-    buffer.FirstElement = shadow.offset(start) / element;
+    let offset = shadow.offset(start);
+    let mut skip = 0;
+    let element = match raw_window(offset, buffer.NumElements, raw_stride(desc.Format, stride)) {
+        Some((first, count, early)) => {
+            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+            buffer.FirstElement = first;
+            buffer.NumElements = count;
+            buffer.StructureByteStride = 0;
+            buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+            skip = early;
+            4
+        }
+        None => {
+            left_structured(desc.Format, stride, buffer.NumElements);
+            buffer.FirstElement = offset / element;
+            element
+        }
+    };
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
     if !in_buffer(&shadow.buffer, first, count, element) {
         #[cfg(feature = "diagnostics")]
@@ -1249,6 +1362,7 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
+    SKIP.with(|s| s.set(skip));
     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
 }
 
@@ -1289,15 +1403,34 @@ fn buffer_uav(
         return None;
     }
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let stride = buffer.StructureByteStride;
+    let align = copy_align(desc.Format, stride, element);
+    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, align)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
     }
-    buffer.FirstElement = shadow.offset(start) / element;
+    let offset = shadow.offset(start);
     buffer.CounterOffsetInBytes = 0;
+    let mut skip = 0;
+    let element = match raw_window(offset, buffer.NumElements, raw_stride(desc.Format, stride)) {
+        Some((first, count, early)) => {
+            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+            buffer.FirstElement = first;
+            buffer.NumElements = count;
+            buffer.StructureByteStride = 0;
+            buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            skip = early;
+            4
+        }
+        None => {
+            left_structured(desc.Format, stride, buffer.NumElements);
+            buffer.FirstElement = offset / element;
+            element
+        }
+    };
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
     if !in_buffer(&shadow.buffer, first, count, element) {
         once!(first, count, element, "unordered buffer view empty or past its host copy");
@@ -1309,7 +1442,9 @@ fn buffer_uav(
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
-    MARK.with(|m| m.set(shadow.mark_entry(start)));
+    // Shaders mark bytes counted from the host view's first byte.
+    MARK.with(|m| m.set(shadow.mark_entry(start - u64::from(skip))));
+    SKIP.with(|s| s.set(skip));
     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
 }
 
@@ -1317,15 +1452,21 @@ thread_local! {
     /// The view-mark entry of the unordered buffer view [`make`] last made
     /// on this thread ([`make_marked`]).
     static MARK: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
+    /// The bytes the raw view [`make`] last made on this thread starts
+    /// before the title's view ([`raw_window`]).
+    static SKIP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// [`make`], and the view-mark entry of the view if it is an unordered
-/// buffer view whose writes shaders mark (`victory_shader::emit`, "Write
-/// marks").
-fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>) {
+/// [`make`], the view-mark entry of the view if it is an unordered buffer
+/// view whose writes shaders mark (`victory_shader::emit`, "Write marks"),
+/// and the bytes the host's view starts before the title's ([`raw_window`];
+/// for its view-stride entry).
+fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>, u32) {
     MARK.with(|m| m.set(None));
+    SKIP.with(|s| s.set(0));
     let kept = make(view, at);
-    (kept, MARK.with(std::cell::Cell::take))
+    let skip = if kept.is_some() { SKIP.with(std::cell::Cell::take) } else { 0 };
+    (kept, MARK.with(std::cell::Cell::take), skip)
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -1768,6 +1909,32 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Which structured views the host makes raw, and where their copies
+    /// start: a stride of whole dwords on a dword of its copy becomes the
+    /// same bytes in dwords, from the 16 bytes at or below (the bytes
+    /// skipped go to the view-stride table); odd strides and typed views
+    /// stay as they are (their copy on an element).
+    #[test]
+    fn structured_views_become_raw_views_of_the_same_bytes() {
+        // 10 elements of 12 bytes at byte 48: dwords 12..42.
+        assert_eq!(raw_window(48, 10, raw_stride(DXGI_FORMAT_UNKNOWN, 12)), Some((12, 30, 0)));
+        // Element 1 of a 456-byte view is not on 16 bytes: from byte 448,
+        // 8 bytes early.
+        assert_eq!(raw_window(456, 4, raw_stride(DXGI_FORMAT_UNKNOWN, 456)), Some((112, 458, 8)));
+        assert_eq!(raw_window(12, 4, raw_stride(DXGI_FORMAT_UNKNOWN, 12)), Some((0, 15, 12)));
+        // Not on a dword: no raw view (its copy starts on one).
+        assert_eq!(raw_window(6, 4, raw_stride(DXGI_FORMAT_UNKNOWN, 12)), None);
+        assert_eq!(copy_align(DXGI_FORMAT_UNKNOWN, 456, 456), 4);
+        // A stride of 6 bytes, a typed view: not made raw.
+        assert_eq!(raw_stride(DXGI_FORMAT_UNKNOWN, 6), 0);
+        assert_eq!(raw_window(48, 10, raw_stride(DXGI_FORMAT_UNKNOWN, 6)), None);
+        assert_eq!(copy_align(DXGI_FORMAT_UNKNOWN, 6, 6), 6);
+        assert_eq!(raw_stride(DXGI_FORMAT_R32G32B32A32_FLOAT, 0), 0);
+        assert_eq!(copy_align(DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16), 16);
+        // Too many dwords for one view.
+        assert_eq!(raw_window(0, u32::MAX, 8), None);
+    }
 
     /// The world's 16-byte view of 0 elements removed the device.
     #[test]

@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, VIEW_BLOCK_SHIFT, VIEW_BLOCKS, VIEW_STRIDES, flags};
+use super::shader::{Shader, VIEW_BLOCK_SHIFT, VIEW_BLOCKS, VIEW_SKIP_SHIFT, VIEW_STRIDES, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{
@@ -264,6 +264,11 @@ struct Lower<'a> {
     /// invocation has work, so they are true.
     merged_wave_mask: HashSet<Value>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    /// [`Lower::view_skip`] of a handle, by block and handle.
+    skips: HashMap<(usize, V), V>,
+    /// The heap index [`Lower::buffer_guard`] checked, by the index it
+    /// gave (which may be the null view's).
+    guarded: HashMap<V, V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -884,6 +889,8 @@ impl<'a> Lower<'a> {
             gs_ops: x.io.gs_ops.iter().copied().collect(),
             merged_wave_mask,
             handles: HashMap::new(),
+            skips: HashMap::new(),
+            guarded: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -2100,6 +2107,78 @@ impl<'a> Lower<'a> {
         Some((lo, self.s.m.bin(self.s.entry, Bin::And, hi, mask)))
     }
 
+    /// An indexed access to a buffer read as structured (`stride` from its
+    /// used-resource entry, `u` the UAV bit): its handle, its two
+    /// coordinates, and the byte of the view it starts at (`index * stride +
+    /// off`, for [`Self::mark_view_write`]).
+    /// Heap and table views are declared raw, at byte `index * stride +
+    /// off`: the host makes the title's structured views raw views of the
+    /// same bytes (NVIDIA addresses a structured view by its own stride), and
+    /// a structured handle on a raw view is undefined in D3D12 (GPU-based
+    /// validation: "Structured buffer byte stride mismatch"; from rminzao's
+    /// review of #1762). A root view keeps its structured handle (which the
+    /// host refuses, as before).
+    #[allow(clippy::too_many_arguments)]
+    fn structured_raw(
+        &mut self,
+        site: Site,
+        src: &Source,
+        index: V,
+        off: V,
+        stride: u32,
+        u: u32,
+    ) -> Result<(V, V, V, V), Why> {
+        let structured = matches!(src, Source::Built { .. });
+        let props = if structured { (12 | u, stride) } else { (11 | u, 0) };
+        let h = self.handle(site, src, false, props)?;
+        let c = self.cur;
+        let k = self.s.m.i32(stride);
+        let elem_off = self.s.m.bin(c, Bin::Mul, index, k);
+        let at = self.s.m.bin(c, Bin::Add, elem_off, off);
+        if structured {
+            return Ok((h, index, off, at));
+        }
+        // The raw view may start a few bytes before the title's view.
+        let at = match self.view_skip(src, h) {
+            Some(skip) => self.s.m.bin(self.cur, Bin::Add, at, skip),
+            None => at,
+        };
+        Ok((h, at, self.s.m.undef(self.s.t.i32), at))
+    }
+
+    /// The bytes the host's raw view at heap handle `h` (made for the
+    /// descriptor `src`) starts before the title's view: the top bits of its
+    /// view-stride entry ([`VIEW_SKIP_SHIFT`]), non-zero only for a
+    /// structured view off 16 bytes of its buffer's copy. `None` for handles
+    /// that are no heap view, and for descriptors whose used-resource entry
+    /// says they are constants or raw (the host makes those views at their
+    /// first byte); a descriptor from the heap itself, or with no entry,
+    /// may name any view.
+    fn view_skip(&mut self, src: &Source, h: V) -> Option<V> {
+        let &(asked, index) = self.s.buffer_index.get(&h)?;
+        // The entry the guard read: 0 where the null view stands in.
+        let index = self.guarded.get(&asked).copied().unwrap_or(index);
+        if !self.is_heap_direct(src)
+            && self
+                .used_kind(src)
+                .is_some_and(|u| u.kind == ResourceType::Cbv || u.stride == 0)
+        {
+            return None;
+        }
+        let c = self.cur;
+        if let Some(&skip) = self.skips.get(&(c, h)) {
+            return Some(skip);
+        }
+        let four = self.s.m.i32(4);
+        let at = self.s.m.bin(c, Bin::Mul, index, four);
+        let table = self.s.root_srv_handle(VIEW_STRIDES);
+        let word = self.raw_dword(table, at);
+        let shift = self.s.m.i32(VIEW_SKIP_SHIFT);
+        let skip = self.s.m.bin(c, Bin::LShr, word, shift);
+        self.skips.insert((c, h), skip);
+        Some(skip)
+    }
+
     /// A raw view `src` at byte offset `off` (`props` as [`Self::handle`]
     /// takes them): its handle and the offset in it. A root view of a
     /// program that uses title memory is title memory at the root address
@@ -2119,7 +2198,11 @@ impl<'a> Lower<'a> {
     ) -> Result<(V, V), Why> {
         let Some((lo, hi)) = self.root_address(src) else {
             let h = self.handle(site, src, false, props)?;
-            let off = match self.root_view_offset(src) {
+            let at = match self.root_view_offset(src) {
+                Some(at) => Some(at),
+                None => self.view_skip(src, h),
+            };
+            let off = match at {
                 Some(at) => self.s.m.bin(self.cur, Bin::Add, off, at),
                 None => off,
             };
@@ -4758,13 +4841,16 @@ impl<'a> Lower<'a> {
                 };
                 ((kind | u, 0x409), Some(kind))
             }
-            Fields::Buffer { idxen, format, .. } => {
+            Fields::Buffer { format, .. } => {
                 let stride = used.map_or(0, |u| u.stride);
                 let props = if un.starts_with("buffer_load_format")
                     || un.starts_with("buffer_store_format")
                 {
                     (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
+                } else if format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
+                    // A structured view's descriptor counts records, also
+                    // when the code reads it at byte offsets (`offen`; from
+                    // AlanQiang0418's review of #1762).
                     (12 | u, stride)
                 } else {
                     (11 | u, 0)
@@ -4790,6 +4876,16 @@ impl<'a> Lower<'a> {
                 (props, None)
             }
             _ => return Err("a scalar memory read as data"),
+        };
+        // A structured buffer is declared raw (see `structured_raw`): its
+        // record count is the raw view's bytes over the stride. Through a
+        // raw view a structured handle's size is its dwords or bytes, not
+        // its elements (from AlanQiang0418's and marquezinii's reviews of
+        // #1762).
+        let (props, record) = if image.is_none() && props.0 & 0xFFF == 12 {
+            ((11 | props.0 & 0x1000, 0), props.1)
+        } else {
+            (props, 0)
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
@@ -4841,7 +4937,18 @@ impl<'a> Lower<'a> {
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
             }
-            None => vec![(2, field(self, 0))],
+            None => {
+                // A raw view that starts early has those bytes more.
+                let mut size = field(self, 0);
+                if let Some(skip) = self.view_skip(&src, h) {
+                    size = self.s.m.bin(c, Bin::Sub, size, skip);
+                }
+                if record > 0 {
+                    let stride = self.s.m.i32(record);
+                    size = self.s.m.bin(c, Bin::UDiv, size, stride);
+                }
+                vec![(2, size)]
+            }
         };
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
@@ -5149,6 +5256,7 @@ impl<'a> Lower<'a> {
         let handle = self.s.heap_handle(c, view, false, true, props);
         // Pages written here are marked in the page table's bitmap.
         self.s.view_index.remove(&handle);
+        self.s.buffer_index.remove(&handle);
         MemoryEntry {
             handle,
             offset: self.s.m.bin(c, Bin::Sub, lo, start),
@@ -5479,7 +5587,9 @@ impl<'a> Lower<'a> {
             &[table, at, iu, mask, four],
         );
         let x = self.s.m.extract(c, r, 0);
-        Ok(self.as_int(x))
+        let word = self.as_int(x);
+        let low = self.s.m.i32((1 << VIEW_SKIP_SHIFT) - 1);
+        Ok(self.s.m.bin(self.cur, Bin::And, word, low))
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -5731,7 +5841,9 @@ impl<'a> Lower<'a> {
         // The null unordered access view sits just below the null SRV.
         let null = super::null_buffer_view() - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
-        self.s.m.select(c, none, null, index)
+        let guarded = self.s.m.select(c, none, null, index);
+        self.guarded.insert(guarded, index);
+        guarded
     }
 
     /// The host's heap index for the view heap index `index` that a load
@@ -9588,11 +9700,9 @@ impl<'a> Lower<'a> {
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    let s = self.s.m.i32(stride);
-                    let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
-                    let byte = self.s.m.bin(self.cur, Bin::Add, row, off);
-                    (h, [index, off, iu], byte)
+                    let (h, at, elem, byte) =
+                        self.structured_raw(site, src, index, off, stride, u)?;
+                    (h, [at, elem, iu], byte)
                 }
                 None => {
                     let (h, off) = self.raw_view(site, src, off, 4, (11 | u, 0), true, guard)?;
@@ -9722,11 +9832,10 @@ impl<'a> Lower<'a> {
                         if stride < 4 || !stride.is_multiple_of(4) {
                             return Err("a structured buffer of unknown stride");
                         }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
-                        let s = self.s.m.i32(stride);
-                        let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
-                        (byte, bytes) = (self.s.m.bin(self.cur, Bin::Add, row, off), 4 * count);
+                        let (h, at, elem, written) =
+                            self.structured_raw(site, src, index, off, stride, u)?;
+                        args.extend([h, at, elem]);
+                        (byte, bytes) = (written, 4 * count);
                     }
                     None => {
                         let n = 4 * count;
@@ -9830,14 +9939,14 @@ impl<'a> Lower<'a> {
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    let (h, at, elem, _) = self.structured_raw(site, src, index, off, stride, u)?;
                     self.s.op(
                         c,
                         "rawBufferLoad.f32",
                         Attr::ReadOnly,
                         self.s.t.res_ret,
                         139,
-                        &[h, index, off, mask, align],
+                        &[h, at, elem, mask, align],
                     )
                 }
                 None => {

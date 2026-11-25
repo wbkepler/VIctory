@@ -17,6 +17,21 @@ pub struct Host {
     pub device: ID3D12Device,
 }
 
+/// Root signatures with the view-stride table (`super::VIEW_STRIDES`), by their
+/// pointer, and its root parameter.
+static STRIDE_TABLES: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// The root parameter of `root`'s view-stride table, if `binds` (the
+/// parameters a test binds) leaves it out: such a test gets a table of
+/// zeros, as the host's holds for views on 16 bytes (no bytes skipped).
+#[cfg(test)]
+fn stride_table(root: &ID3D12RootSignature, binds: impl Iterator<Item = u32>) -> Option<u32> {
+    let known = STRIDE_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+    let &(_, param) = known.iter().find(|&&(r, _)| r == root.as_raw() as usize)?;
+    let mut binds = binds;
+    (!binds.any(|p| p == param)).then_some(param)
+}
+
 /// What the stage declares that a pipeline must match.
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;
@@ -292,6 +307,12 @@ impl Host {
             views.push((super::VIEW_MARKS, super::MEMORY_SPACE, 1));
             views.push((super::VIEW_WRITES, super::MEMORY_SPACE, 2));
         }
+        // The view-stride table's parameter: a dispatch or draw that does
+        // not bind it gets a table of zeros (`stride_table`).
+        let strides = views
+            .iter()
+            .position(|&(r, space, kind)| r == u32::from(super::VIEW_STRIDES) && space == super::ROOT_CBV_SPACE && kind == 1)
+            .map(|i| (params.len() + i) as u32);
         for (register, space, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {
@@ -367,7 +388,13 @@ impl Host {
                 blob.GetBufferPointer().cast::<u8>(),
                 blob.GetBufferSize(),
             );
-            self.device.CreateRootSignature(0, bytes).map_err(err)
+            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes).map_err(err)?;
+            let mut known = STRIDE_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+            known.retain(|&(r, _)| r != root.as_raw() as usize);
+            if let Some(param) = strides {
+                known.push((root.as_raw() as usize, param));
+            }
+            Ok(root)
         }
     }
 
@@ -1247,6 +1274,11 @@ impl Host {
                     Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
                 }
             }
+            if let Some(param) = stride_table(root, d.roots.iter().map(|r| r.0)) {
+                let b = make(D3D12_HEAP_TYPE_UPLOAD, &buf_desc(1 << 16), D3D12_RESOURCE_STATE_GENERIC_READ, None)?;
+                list.SetGraphicsRootShaderResourceView(param, b.GetGPUVirtualAddress());
+                keep.push(b);
+            }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: w as f32,
@@ -1417,7 +1449,12 @@ pub enum Stride {
     Raw,
     /// RGBA32F elements.
     Typed,
-    /// Structured, elements of this many bytes.
+    /// Structured, elements of this many bytes. A translated program reads
+    /// it through a raw view of the same bytes, as the runtime makes the
+    /// title's structured views (NVIDIA reads a structured view by its own
+    /// stride whatever the shader's read; from marquezinii's and
+    /// welisonzika14-jpg's reviews of #1762); native PC code, which declares
+    /// a structured buffer, through a structured view ([`Host::dispatch_native`]).
     Structured(u32),
     /// Typed, elements in this format of this many bytes.
     Format(DXGI_FORMAT, u32),
@@ -1442,6 +1479,29 @@ impl Host {
         root: &ID3D12RootSignature,
         pso: &ID3D12PipelineState,
         d: &Dispatch,
+    ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_as(root, pso, d, false)
+    }
+
+    /// [`Self::dispatch`] for native PC code: [`Stride::Structured`] views
+    /// are structured, as its declarations are (a structured declaration
+    /// read through a raw view reads wrong on NVIDIA: an RTX 5080 got every
+    /// lane wrong; from AlanQiang0418's review of #1762).
+    pub fn dispatch_native(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+    ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_as(root, pso, d, true)
+    }
+
+    fn dispatch_as(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        native: bool,
     ) -> Result<Vec<Vec<u32>>, String> {
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -1795,11 +1855,17 @@ impl Host {
                                 0,
                                 D3D12_BUFFER_SRV_FLAG_NONE,
                             ),
-                            Stride::Structured(s) => (
+                            Stride::Structured(s) if native => (
                                 DXGI_FORMAT_UNKNOWN,
                                 data.len() * 4 / s as usize,
                                 s,
                                 D3D12_BUFFER_SRV_FLAG_NONE,
+                            ),
+                            Stride::Structured(_) => (
+                                DXGI_FORMAT_R32_TYPELESS,
+                                data.len(),
+                                0,
+                                D3D12_BUFFER_SRV_FLAG_RAW,
                             ),
                             Stride::Format(f, bytes) => (
                                 f,
@@ -1969,6 +2035,11 @@ impl Host {
                         uavs.push((b, None, n, rb));
                     }
                 }
+            }
+            if let Some(param) = stride_table(root, d.roots.iter().map(|r| r.0)) {
+                let b = upload(&vec![0; 1 << 14])?;
+                list.SetComputeRootShaderResourceView(param, b.GetGPUVirtualAddress());
+                keep.push(b);
             }
             let [x, y, z] = d.groups;
             list.Dispatch(x, y, z);

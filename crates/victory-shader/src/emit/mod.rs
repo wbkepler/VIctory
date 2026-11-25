@@ -129,6 +129,17 @@
 //!   buffer SRV (UAV). The index comes from data, and a texture descriptor
 //!   read as a buffer one is a wild address (the texture's shifted 8 bits
 //!   down: GPU faults at low addresses).
+//! * **Views off 16 bytes** (added 2026-11-25): the host makes a
+//!   structured view raw from the 16 bytes at or below its first byte, in
+//!   its buffer's own copy, and keeps the bytes skipped in the top bits of
+//!   its view-stride entry ([`VIEW_SKIP_SHIFT`]). Every byte a program
+//!   addresses through a raw heap view that may be such a view (one from
+//!   the heap itself, or whose used-resource entry has a stride or is
+//!   missing) adds them, and a size read as data takes them off. Constant
+//!   and raw views (no stride in their entry) start at their first byte.
+//!   From astrosteveo's review of #1762: a copy of the view's own bytes
+//!   instead did not see writes made through the buffer's view earlier in
+//!   the same list, nor that view its writes.
 //! * **Heap access** ([`HostShader::heap`], [`HostShader::heap_writes`],
 //!   added 2026-11-24): whether the shader takes descriptors from the
 //!   resource heap itself, and unordered access views among them; the
@@ -256,8 +267,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
-    VIEW_BLOCK_SHIFT, VIEW_BLOCKS, VIEW_MARK_NONE, VIEW_MARKS, VIEW_STRIDES, VIEW_WRITE_BITS,
-    VIEW_WRITES, heap_views, null_buffer_view, set_view_heap, view_blocks,
+    VIEW_BLOCK_SHIFT, VIEW_BLOCKS, VIEW_MARK_NONE, VIEW_MARKS, VIEW_SKIP_SHIFT, VIEW_STRIDES,
+    VIEW_WRITE_BITS, VIEW_WRITES, heap_views, null_buffer_view, set_view_heap, view_blocks,
 };
 
 /// The loop limit without an override: 2^20.
