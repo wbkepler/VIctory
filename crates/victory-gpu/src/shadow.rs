@@ -1552,7 +1552,7 @@ pub(crate) fn near(va: u64) -> String {
     text
 }
 
-/// Lazy copy-back (`VICTORY_LAZY_COPY_BACK=1`): a page shaders marked as
+/// Lazy copy-back (`VICTORY_LAZY_COPY_BACK`, on unless `0`): a page shaders marked as
 /// written through views of a copy does not go back into title memory
 /// after the submission. Its title mappings (every address showing it) are
 /// hidden instead (no access), and the copy keeps the GPU's bytes: the
@@ -1584,7 +1584,7 @@ pub(crate) mod lazy {
     /// Whether copy-backs of marked pages wait for the CPU's first look.
     pub(crate) fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("VICTORY_LAZY_COPY_BACK").as_deref() == Ok("1"))
+        *ON.get_or_init(|| crate::switch::on_by_default("VICTORY_LAZY_COPY_BACK"))
     }
 
     /// Where pending pages were brought back from.

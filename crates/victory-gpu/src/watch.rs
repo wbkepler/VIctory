@@ -295,7 +295,10 @@ fn runtime_memory(at: usize, views: bool) -> bool {
 
 impl Drop for Tracked {
     /// Pages no tracker holds any more get write access back, so that the
-    /// guard set never names memory freed and allocated again.
+    /// guard set never names memory freed and allocated again; unless another
+    /// mapping of the page is held: the guard here is that tracker's too (it
+    /// was set when that tracker took its page), and with it opened a write
+    /// here went unseen there.
     fn drop(&mut self) {
         let mut g = guards();
         let mut free = Vec::new();
@@ -309,7 +312,10 @@ impl Drop for Tracked {
             }
         }
         for page in free {
-            open(&mut g, page);
+            let watched_elsewhere = g.alias_of.get(&page).is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)));
+            if !watched_elsewhere {
+                open(&mut g, page);
+            }
         }
     }
 }
@@ -556,6 +562,18 @@ impl Tracked {
 pub(crate) fn alias_pages(page: usize) -> Vec<usize> {
     let g = guards();
     alias_pages_of(&g, page)
+}
+
+/// The pages (page numbers) showing the memory of `[at, at + len)`
+/// elsewhere, as the runtime said when it mapped them: a write there
+/// changes them too.
+pub(crate) fn aliased_pages(at: usize, len: usize) -> Vec<usize> {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let g = guards();
+    g.alias_of
+        .range(first..last)
+        .flat_map(|(_, others)| others.iter().copied())
+        .collect()
 }
 
 fn alias_pages_of(g: &Guards, page: usize) -> Vec<usize> {
@@ -1111,6 +1129,22 @@ pub(crate) mod tests {
         // takes it for `a`'s pages here).
         unsafe { (c as *mut u32).write_volatile(1) };
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
+    }
+
+    /// A tracker of one mapping going away leaves the guard its page shares
+    /// with a tracker of another mapping, so a write there still counts (it
+    /// was opened, and the pages it went unseen in stayed clean).
+    #[test]
+    fn a_tracker_dropped_on_one_mapping_leaves_the_other_guarded() {
+        let (a, b) = twin_views(1);
+        let t = track(a, PAGE, true).expect("views are tracked");
+        let u = track(b, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert_eq!(u.take(b, b + PAGE), [(b, b + PAGE)]);
+        drop(u);
+        // SAFETY: the second view, guarded for `t`'s page too.
+        unsafe { ((b + 4) as *mut u32).write_volatile(7) };
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
     }
 
     /// A write or mapping that runs past the end of the address space (a
