@@ -167,12 +167,22 @@ fn mirror(handle: u64) {
 /// heap at indices in their data, where a slot never mirrored reads nothing.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
-    #[cfg(feature = "diagnostics")]
-    host::stats::tick();
+    // Every host heap, also those the title did not write: descriptors
+    // made by calls leave views to settle too.
+    let hosts = std::cell::RefCell::new(Vec::new());
     sync_heaps_with(
-        |heap| heap.host.get()?.as_ref().map(std::sync::Arc::clone),
+        |heap| {
+            let host = heap.host.get()?.as_ref().map(std::sync::Arc::clone)?;
+            hosts.borrow_mut().push(std::sync::Arc::clone(&host));
+            Some(host)
+        },
         |host, first, last, step, bytes| host.mirror_bytes(first, last, step, bytes),
     );
+    // Views that only moved between the title's slots kept their host
+    // slots; those no slot holds any more give theirs back.
+    for host in hosts.into_inner() {
+        host.settle();
+    }
 }
 
 /// Collects dirty ranges under `SHADER_HEAPS`, drops the lock, safely copies
@@ -304,8 +314,8 @@ pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) ->
     Some(f(host))
 }
 
-/// Diagnostics: how the host view heaps' title blocks and dynamic slots
-/// are used, over the last `frames` frames.
+/// Diagnostics: how the host view heaps' slots for the title's views and
+/// their dynamic slots are used, over the last `frames` frames.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn log_heaps(frames: f64) {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());

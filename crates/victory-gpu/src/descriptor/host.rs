@@ -7,9 +7,11 @@
 //!
 //! A host that caps its view heaps below what translated shaders index by
 //! default (NVIDIA: 1,000,000 slots) cannot keep that order for a title
-//! heap larger than its own: there a view heap holds the title's slots by
-//! blocks ([`Blocks`]), and shaders find a title slot through its block.
+//! heap larger than its own: there a view heap holds each distinct view of
+//! the title's once, wherever a slot was free ([`Slots`]), and shaders find
+//! a title slot's view through a table of the title's slots.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -22,20 +24,28 @@ pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
-    /// Slots mirroring the title's; view heaps have `dynamic` more.
+    /// Slots for the title's views; view heaps have `dynamic` more.
     count: u32,
     /// The title heap's slots: `count`, or more where the host caps its
-    /// view heaps and holds the title's slots by blocks.
+    /// view heaps and holds each distinct view of the title's once.
     title: u32,
-    /// Where the title's slots lie, in a view heap of a host that caps
-    /// them; elsewhere title slot `i` is host slot `i`.
-    blocks: Option<Blocks>,
+    /// Where the title's views lie, in a view heap of a host that caps
+    /// them, for a title heap with more slots than fit; elsewhere title
+    /// slot `i` is host slot `i`.
+    slots: Option<Slots>,
+    /// The view-slot table of a title heap that fits whole in a view heap
+    /// of a host that caps them: dword `i` is `i`, for the title's slots
+    /// and the host's own past them (shaders translated for such a host
+    /// read one whatever the heap).
+    order: Option<ID3D12Resource>,
     /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
     /// where the host takes them, [`CAPPED_DYNAMIC`] in a capped heap
     /// ([`capped_layout`]), else [`MIN_DYNAMIC`].
     dynamic: u32,
     sampler: bool,
-    /// The record (view index and generation) each slot was last made from.
+    /// The record (view index and generation) each of the title's slots was
+    /// last made from: by title slot, which is the host's except in a heap
+    /// that shares its views ([`Slots`]).
     made: Mutex<Vec<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
@@ -111,10 +121,10 @@ const DYNAMIC: u32 = 1 << 18;
 const MIN_DYNAMIC: u32 = 1 << 16;
 
 /// The dynamic slots of a heap on a host that caps its view heaps
-/// ([`capped_layout`]): each one is a title slot fewer. The world on an
-/// RTX 5090 took at most ~111,500 at once (while it loads; 55,000-77,000
-/// after), and beside 2^18 of them the title's views wanted ~300 blocks
-/// more than the heap had left.
+/// ([`capped_layout`]): each one is a slot fewer for the title's views.
+/// The world on an RTX 5090 took at most ~111,500 at once while tables
+/// were made afresh there; shaders now find a table's entries through the
+/// view-slot table, which leaves the dynamic slots to root views.
 const CAPPED_DYNAMIC: u32 = 1 << 17;
 
 /// The slots a capped heap keeps for host copies' view pairs
@@ -123,30 +133,14 @@ const CAPPED_DYNAMIC: u32 = 1 << 17;
 /// would leave no long runs free there (root views take 256 at a time).
 const CAPPED_PAIRS: u32 = 1 << 14;
 
-/// The title slots of one block of a capped heap ([`Blocks`]).
-const BLOCK: u32 = 1 << victory_shader::emit::VIEW_BLOCK_SHIFT;
-
-/// No host block.
-const NONE: u32 = u32::MAX;
-
-/// Host blocks are taken in groups of this many while whole groups are
-/// free: the first title block of a stretch takes the first of a group,
-/// those after it the rest ([`BlockMap::take`]), so that a table reaching
-/// from one block into the next finds its slots in one run. (Titles hand
-/// out table slots from chunks of a few thousand.)
-const GROUP: usize = 4;
-
-/// The most title blocks whose waiting views one sync makes
-/// ([`HostHeap::retry`]).
-const RETRY_BLOCKS: usize = 16;
-
 /// How the `views` slots of a view heap are shared on a host that makes no
-/// larger one (1,000,000 on NVIDIA): the slots for the title's at most, its
-/// dynamic slots, and the slots kept for view pairs past them. The last
-/// three stay null: the null buffer views and the slot shaders' heap
-/// indices are clamped to (`victory_shader::emit::null_buffer_view`).
+/// larger one (1,000,000 on NVIDIA): the slots for the title's views at
+/// most, its dynamic slots, and the slots kept for view pairs past them.
+/// The last three stay null: the null buffer views and the slot shaders'
+/// heap indices are clamped to (`victory_shader::emit::null_buffer_view`),
+/// which is also where a title slot without a view leads.
 ///
-/// The dynamic slots come first: tables whose slots the heap does not hold
+/// The dynamic slots come first: tables whose views the heap does not hold
 /// in one run are made afresh in dynamic slots for every draw, and 2^16 of
 /// those ran out in seconds ([`CAPPED_DYNAMIC`]).
 fn capped_layout(views: u32) -> (u32, u32, u32) {
@@ -163,198 +157,185 @@ pub(crate) fn host_views(views: u32) {
     if views >= victory_shader::emit::HEAP_VIEWS {
         return;
     }
-    let (title, dynamic, _) = capped_layout(views);
+    let (shared, dynamic, _) = capped_layout(views);
     tracing::info!(
         views,
-        blocks = title / BLOCK,
+        shared,
         dynamic,
-        "the host caps shader-visible view heaps: shaders are translated for heaps of that size, which hold a title heap's slots by blocks of {BLOCK}"
+        "the host caps shader-visible view heaps: shaders are translated for heaps of that size, which hold each distinct view of a title heap once; the title's slots lead to them through a table"
     );
     victory_shader::emit::set_view_heap(views, true);
 }
 
-/// Where the title's slots lie in a view heap of a host that caps its view
-/// heaps (NVIDIA: 1,000,000 slots; the title's heap may have more, most of
-/// them empty): by blocks of [`BLOCK`] title slots. A block's slots follow
-/// each other in the host heap, in the title's order; the blocks lie
-/// wherever one was free when the title first wrote a view into them, and
-/// give their host block back when their last view is gone. Shaders taking
-/// descriptors from the heap itself look the block up (`table`); tables
-/// are given the host slot of their first entry (`HostHeap::run`).
-///
-/// A title heap that fits whole keeps the title's order (`sparse` false):
-/// every block has its host block from the start.
-// shortcut: with every host block taken, a view in a block without one is
-// left out, as the slots past a capped heap were (`HostHeap::mirror` counts
-// them); blocks whose views only went stale (their resource released, the
-// slot not rewritten) keep their host block.
-struct Blocks {
-    /// The view-block table translated shaders read
-    /// (`victory_shader::emit::VIEW_BLOCKS`): per block of title slots,
-    /// the host slot of its first; `null` for a block without host slots.
-    /// One dword for every block a shader can come to, mapped at the
-    /// address kept beside it.
+/// Where the title's views lie in a view heap of a host that caps its view
+/// heaps (NVIDIA: 1,000,000 slots; the title's heap may have more, and in
+/// the world holds views in most of them): each distinct view once,
+/// wherever a slot was free, however many of the title's slots hold it. A
+/// title's records name its distinct views already (`super::Views`), and
+/// its slots repeat them several times over, so the views fit where the
+/// slots did not. Shaders look every view heap index up (`table`), those
+/// they take from the heap itself and those of descriptor tables alike: a
+/// table is read where the title has it, though its views lie apart.
+struct Slots {
+    /// The view-slot table translated shaders read
+    /// (`victory_shader::emit::VIEW_SLOTS`): per title slot, the host slot
+    /// of the view it holds; `null` for a slot without one. One dword for
+    /// every index a shader can come to, in video memory the CPU writes
+    /// where the host has that (shaders read it for every descriptor they
+    /// take, and NVIDIA reads system memory far slower),
+    /// mapped at the address kept beside it and never read back.
     table: (ID3D12Resource, usize),
-    /// The first slot of the host block no view is made in: the last of
-    /// the heap's slots for the title's.
+    /// Where a title slot without a view leads: the heap's last slot,
+    /// which stays null.
     null: u32,
-    sparse: bool,
-    map: Mutex<BlockMap>,
+    map: Mutex<SlotMap>,
 }
 
-struct BlockMap {
-    /// Each title block's host block, or [`NONE`].
+/// A distinct view of the title's in a heap that shares them.
+struct Shared {
+    slot: u32,
+    /// The title slots that hold it. With none it stays until the sync is
+    /// over ([`HostHeap::settle`]): a view that only moves between title
+    /// slots is not made twice.
+    held: u32,
+    /// Made on the host; a view of a texture the title placed itself is
+    /// left for a draw ([`HostHeap::make_slot`]).
+    made: bool,
+    /// A buffer view, and the generation of the host copies
+    /// ([`crate::shadow::generation`]) it was last known to read the right
+    /// one at.
+    buffer: bool,
+    stamp: u64,
+}
+
+/// A record key (view index, generation) mixed into a hash.
+#[derive(Default)]
+struct KeyHasher(u64);
+
+impl std::hash::Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+    fn write_u64(&mut self, key: u64) {
+        let mixed = (self.0 ^ key).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = mixed ^ mixed >> 32;
+    }
+}
+
+struct SlotMap {
+    /// Each title slot's host slot: the table's dwords.
     host: Vec<u32>,
-    /// The host blocks taken.
-    taken: Vec<bool>,
-    /// How many of each title block's slots hold a view, and which do
-    /// (a bit per title slot).
-    views: Vec<u32>,
-    held: Vec<u64>,
-    /// The host blocks not taken.
-    free: usize,
-    /// Per title slot holding a view that found no host block free, its
-    /// record's key (else 0): the sync skips it while the title leaves it
-    /// unchanged, and it is made once a host block is free for its block
-    /// ([`HostHeap::retry`]). How many each title block has, and in all.
-    waiting: Vec<u64>,
-    waiting_in: Vec<u32>,
-    unplaced: usize,
-    /// Whether some waiting slot may now find a host slot: its block has
-    /// one, or a host block was given back.
-    retry: bool,
-    /// The most host blocks taken at once so far (logged as it grows).
-    peak: usize,
-    /// Diagnostics: per title block, when a view was last written there or
-    /// a table read through it ([`stats::TICK`]).
-    #[cfg(feature = "diagnostics")]
-    touched: Vec<u32>,
+    /// The distinct views the title's slots hold, by record key.
+    views: HashMap<u64, Shared, std::hash::BuildHasherDefault<KeyHasher>>,
+    /// The host slots taken, a bit each; those there are; where the search
+    /// for a free one starts.
+    taken: Vec<u64>,
+    slots: u32,
+    next: u32,
+    used: u32,
+    /// The title slots that hold a view.
+    live: u32,
+    /// Views whose last title slot gave them up since the last
+    /// [`HostHeap::settle`].
+    idle: Vec<u64>,
+    /// Title views that found no host slot free, so far.
+    refused: u64,
+    /// The most host slots taken at once so far (logged as it grows).
+    peak: u32,
 }
 
-/// Diagnostics: how capped heaps' blocks and dynamic slots are used.
+/// Counts one of [`stats`] (diagnostics builds).
+macro_rules! count {
+    ($name:ident) => {
+        #[cfg(feature = "diagnostics")]
+        stats::$name.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    };
+}
+
+/// Diagnostics: how the heaps' slots are used.
 #[cfg(feature = "diagnostics")]
 pub(crate) mod stats {
     use std::sync::atomic::AtomicU64;
     /// Microseconds in `sync_heaps`.
     pub(crate) static SYNC_US: AtomicU64 = AtomicU64::new(0);
-    /// Title slots brought up to date (`set_slot`), and those of them
-    /// holding a view without a host slot.
+    /// Title slots brought up to date (`set_slot`).
     pub(crate) static VISITS: AtomicU64 = AtomicU64::new(0);
-    pub(crate) static UNPLACED_VISITS: AtomicU64 = AtomicU64::new(0);
     /// Dynamic slots taken now, and the most since the last log.
     pub(crate) static DYNAMIC_USED: AtomicU64 = AtomicU64::new(0);
     pub(crate) static DYNAMIC_PEAK: AtomicU64 = AtomicU64::new(0);
-    /// Tenths of a second since the first sync, as of the last one (when
-    /// title blocks were last written or read through a table).
-    pub(crate) static TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    /// In heaps that share their views: dwords written to the view-slot
+    /// table; views made, made again (their host resource changed, or a
+    /// draw came for one left for it) and given back.
+    pub(crate) static WRITES: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static CREATED: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static REMADE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static FREED: AtomicU64 = AtomicU64::new(0);
+    /// Views made in dynamic slots (tables made afresh, and the like).
+    pub(crate) static TABLE_VIEWS: AtomicU64 = AtomicU64::new(0);
+}
 
-    /// Brings [`TICK`] up to date (each sync).
-    pub(crate) fn tick() {
-        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-        let tenths = START
-            .get_or_init(std::time::Instant::now)
-            .elapsed()
-            .as_millis()
-            / 100;
-        TICK.store(tenths as u32, std::sync::atomic::Ordering::Relaxed);
+impl SlotMap {
+    /// A free host slot, the next at or after the last one taken.
+    fn take(&mut self) -> Option<u32> {
+        if self.used >= self.slots {
+            return None;
+        }
+        let words = self.taken.len();
+        let mut word = (self.next / 64) as usize;
+        // The first word from `next` on; it comes round again whole.
+        let mut free = !self.taken[word] & (!0u64 << (self.next % 64));
+        for _ in 0..=words {
+            if free != 0 {
+                let slot = word as u32 * 64 + free.trailing_zeros();
+                self.taken[word] |= 1 << (slot % 64);
+                self.used += 1;
+                self.next = (slot + 1) % self.slots;
+                if self.used > self.peak && (self.used.is_power_of_two() || self.used.is_multiple_of(1 << 16)) {
+                    tracing::info!(
+                        used = self.used,
+                        of = self.slots,
+                        title_slots = self.live,
+                        "host view heap: distinct title views in use"
+                    );
+                }
+                self.peak = self.peak.max(self.used);
+                return Some(slot);
+            }
+            word = (word + 1) % words;
+            free = !self.taken[word];
+        }
+        None
     }
 
-    pub(super) fn now() -> u32 {
-        TICK.load(std::sync::atomic::Ordering::Relaxed)
+    /// Host slot `slot` is free again.
+    fn give(&mut self, slot: u32) {
+        self.taken[(slot / 64) as usize] &= !(1 << (slot % 64));
+        self.used -= 1;
+    }
+
+    /// A title slot gave up the view of record `key`.
+    fn release(&mut self, key: u64) {
+        if let Some(shared) = self.views.get_mut(&key) {
+            shared.held = shared.held.saturating_sub(1);
+            if shared.held == 0 {
+                self.idle.push(key);
+            }
+        }
     }
 }
 
-impl BlockMap {
-    /// A free host block for title block `block`: the one after its
-    /// predecessor's or before its successor's where that is free, else
-    /// the first of a free group, else any.
-    fn take(&mut self, block: usize) -> Option<u32> {
-        // Every visit of a waiting slot would search the whole heap.
-        if self.free == 0 {
-            return None;
-        }
-        let free = |h: usize| self.taken.get(h) == Some(&false);
-        let mapped = |b: Option<usize>| b.and_then(|b| self.host.get(b)).filter(|&&h| h != NONE).map(|&h| h as usize);
-        let after = mapped(block.checked_sub(1)).map(|h| h + 1).filter(|&h| free(h));
-        let before = || mapped(Some(block + 1)).and_then(|h| h.checked_sub(1)).filter(|&h| free(h));
-        let group = || (0..self.taken.len()).step_by(GROUP).find(|&h| (h..h + GROUP).all(free));
-        let any = || self.taken.iter().position(|taken| !taken);
-        let h = after.or_else(before).or_else(group).or_else(any)?;
-        self.taken[h] = true;
-        self.host[block] = h as u32;
-        self.free -= 1;
-        let used = self.taken.len() - self.free;
-        if used > self.peak && (used.is_power_of_two() || used.is_multiple_of(64)) {
-            tracing::info!(used, of = self.taken.len(), "host view heap: blocks of title slots in use");
-        }
-        self.peak = self.peak.max(used);
-        if self.waiting_in[block] > 0 {
-            self.retry = true;
-        }
-        Some(h as u32)
-    }
-
-    /// Title slot `index` waits for a host slot with its record's `key`,
-    /// or (`None`) does not.
-    fn wait(&mut self, index: u32, key: Option<u64>) {
-        let (slot, block) = (index as usize, (index / BLOCK) as usize);
-        let new = key.unwrap_or(0);
-        let old = std::mem::replace(&mut self.waiting[slot], new);
-        match (old != 0, new != 0) {
-            (false, true) => {
-                self.waiting_in[block] += 1;
-                self.unplaced += 1;
-            }
-            (true, false) => {
-                self.waiting_in[block] -= 1;
-                self.unplaced -= 1;
-            }
-            _ => {}
-        }
-    }
-
-    /// A title block whose waiting slots can be made now (it has a host
-    /// block, or one is free: the block with the most waiting), and those
-    /// slots with their keys.
-    fn ready(&mut self) -> Option<Vec<(u32, u64)>> {
-        if !self.retry || self.unplaced == 0 {
-            self.retry = false;
-            return None;
-        }
-        let waiting = |b: &usize| self.waiting_in[*b] > 0;
-        let block = (0..self.host.len())
-            .filter(waiting)
-            .find(|&b| self.host[b] != NONE)
-            .or_else(|| {
-                (self.free > 0)
-                    .then(|| {
-                        (0..self.host.len())
-                            .filter(waiting)
-                            .max_by_key(|&b| self.waiting_in[b])
-                    })
-                    .flatten()
-            });
-        let Some(block) = block else {
-            self.retry = false;
-            return None;
-        };
-        let first = block * BLOCK as usize;
-        let end = (first + BLOCK as usize).min(self.waiting.len());
-        Some(
-            (first..end)
-                .filter(|&i| self.waiting[i] != 0)
-                .map(|i| (i as u32, self.waiting[i]))
-                .collect(),
-        )
-    }
-}
-
-impl Blocks {
-    /// Title block `block` now starts at host slot `first`.
-    fn write(&self, block: usize, first: u32) {
+impl Slots {
+    /// Title slot `index` now leads to host slot `slot`.
+    fn write(&self, index: u32, slot: u32) {
         // SAFETY: a dword of the mapped table, which has one for each of
-        // the title's blocks.
-        unsafe { (self.table.1 as *mut u32).add(block).write_volatile(first) };
+        // the title's slots.
+        unsafe { (self.table.1 as *mut u32).add(index as usize).write_volatile(slot) };
+        count!(WRITES);
     }
 }
 
@@ -410,7 +391,7 @@ impl HostHeap {
         // `HEAP_SAMPLERS`: slots up to there exist and stay null.
         let samplers = victory_shader::emit::HEAP_SAMPLERS;
         let title = count;
-        let mut blocks = None;
+        let (mut slots, mut order) = (None, None);
         let (heap, count, extra) = if sampler {
             match make(count.max(samplers)) {
                 Ok(heap) => (heap, count, 0),
@@ -422,54 +403,63 @@ impl HostHeap {
         } else if views < victory_shader::emit::HEAP_VIEWS {
             // A host that makes no larger view heap (NVIDIA): every heap
             // has all the slots there are, so each index a shader can come
-            // to exists. The title's slots are held by blocks: as many as
-            // the title has, or as fit beside the dynamic slots and the
-            // pairs, and one more that stays null.
+            // to exists. Below the dynamic slots and the pairs it holds
+            // the title's slots if they fit, in the title's order, and
+            // else the title's distinct views.
             let (room, dynamic, _) = capped_layout(views);
-            let (wanted, fit) = (count.div_ceil(BLOCK), room / BLOCK);
-            let Some(host_blocks) = fit.checked_sub(1).map(|fit| fit.min(wanted)) else {
-                tracing::warn!(count, views, "no host descriptor heap: no room for a block of title slots");
+            if room == 0 {
+                tracing::warn!(count, views, "no host descriptor heap: no room for the title's views");
                 return None;
-            };
-            let sparse = wanted > host_blocks;
-            if sparse {
-                tracing::info!(count, wanted, host_blocks, dynamic, "host view heap capped at {views}: the title's slots get host slots by blocks of {BLOCK}, as it writes views");
             }
-            let null = host_blocks * BLOCK;
-            // An entry for every block a shader can index, and for the
-            // title's: all without host slots at first.
-            let entries = wanted.max(victory_shader::emit::HEAP_VIEWS / BLOCK);
-            let Some((table, data)) = host.upload_buffer(u64::from(entries) * 4) else {
-                tracing::warn!(count, views, "no host descriptor heap: no view-block table");
+            let fits = count <= room;
+            // The heap's last slot: never made, without a stride or mark.
+            let null = views - 1;
+            // An entry for every index a shader can come to, and for the
+            // title's: the slot itself where the heap keeps the title's
+            // order (a table made afresh in dynamic slots is read there),
+            // else without a view at first.
+            let entries = count.max(victory_shader::emit::HEAP_VIEWS);
+            let bytes = u64::from(entries) * 4;
+            let Some((table, data)) = host.gpu_upload_buffer(bytes).or_else(|| host.upload_buffer(bytes)) else {
+                tracing::warn!(count, views, "no host descriptor heap: no view-slot table");
                 return None;
             };
-            crate::host::name(&table, || "view blocks".into());
-            for block in 0..entries {
-                let first = if sparse || block >= wanted { null } else { block * BLOCK };
+            crate::host::name(&table, || "view slots".into());
+            for index in 0..entries {
+                let slot = if fits && index < views { index } else { null };
                 // SAFETY: a dword of the mapped table, which has `entries`.
-                unsafe { data.cast::<u32>().add(block as usize).write_volatile(first) };
+                unsafe { data.cast::<u32>().add(index as usize).write_volatile(slot) };
             }
-            blocks = Some(Blocks {
-                table: (table, data as usize),
-                null,
-                sparse,
-                map: Mutex::new(BlockMap {
-                    host: (0..wanted).map(|b| if sparse { NONE } else { b }).collect(),
-                    taken: vec![!sparse; host_blocks as usize],
-                    views: vec![0; wanted as usize],
-                    held: vec![0; if sparse { count.div_ceil(64) as usize } else { 0 }],
-                    free: if sparse { host_blocks as usize } else { 0 },
-                    waiting: vec![0; if sparse { count as usize } else { 0 }],
-                    waiting_in: vec![0; if sparse { wanted as usize } else { 0 }],
-                    unplaced: 0,
-                    retry: false,
-                    peak: 0,
-                    #[cfg(feature = "diagnostics")]
-                    touched: vec![0; if sparse { wanted as usize } else { 0 }],
-                }),
-            });
+            let shared = if fits {
+                order = Some(table);
+                count
+            } else {
+                tracing::info!(count, shared = room, dynamic, "host view heap capped at {views}: each distinct view of the title's gets a host slot, as the title writes it");
+                let mut taken = vec![0u64; room.div_ceil(64) as usize];
+                // No slots past the last.
+                if !room.is_multiple_of(64) {
+                    taken[(room / 64) as usize] = !0 << (room % 64);
+                }
+                slots = Some(Slots {
+                    table: (table, data as usize),
+                    null,
+                    map: Mutex::new(SlotMap {
+                        host: vec![null; count as usize],
+                        views: HashMap::default(),
+                        taken,
+                        slots: room,
+                        next: 0,
+                        used: 0,
+                        live: 0,
+                        idle: Vec::new(),
+                        refused: 0,
+                        peak: 0,
+                    }),
+                });
+                room
+            };
             match make(views) {
-                Ok(heap) => (heap, null + BLOCK, dynamic),
+                Ok(heap) => (heap, shared, dynamic),
                 Err(e) => {
                     tracing::warn!(error = %e, count, views, "no host descriptor heap");
                     return None;
@@ -510,16 +500,20 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
+        // The title's slots as `made` tracks them: all of them where they
+        // lead to shared views, else those the heap has.
+        let tracked = if slots.is_some() { title } else { count };
         let h = HostHeap {
             heap,
             cpu,
             step,
             count,
             title,
-            blocks,
+            made: Mutex::new(vec![0; tracked as usize]),
+            slots,
+            order,
             dynamic: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -712,132 +706,60 @@ impl HostHeap {
         }
     }
 
-    /// The slots this heap has for the title's (the dynamic ones follow
-    /// them); fewer than the title's when the host caps its size.
+    /// The slots this heap has for the title's views (the dynamic ones
+    /// follow them); fewer than the title's slots when the host caps its
+    /// size.
     pub(crate) fn count(&self) -> u32 {
         self.count
     }
 
-    /// The host slot of title slot `index`, if it has one.
+    /// The host slot of title slot `index`, if it has one: its own, or
+    /// that of the view it holds in a heap that shares its views.
+    #[cfg(any(test, feature = "diagnostics"))]
     fn slot(&self, index: u32) -> Option<u32> {
-        let Some(blocks) = &self.blocks else {
+        let Some(slots) = &self.slots else {
             return (index < self.count).then_some(index);
         };
-        if index >= self.title {
-            return None;
-        }
-        let map = blocks.map.lock().unwrap_or_else(|e| e.into_inner());
-        let host = map.host[(index / BLOCK) as usize];
-        (host != NONE).then(|| host * BLOCK + index % BLOCK)
+        let map = slots.map.lock().unwrap_or_else(|e| e.into_inner());
+        let host = *map.host.get(index as usize)?;
+        (host != slots.null).then_some(host)
     }
 
-    /// The host slot of title slot `index`, which holds a view now (its
-    /// record's `key`) or none: its block takes a host block with its first
-    /// view. None if the heap has no slot for it; a view in a block that
-    /// found no host block free waits for one ([`HostHeap::retry`]).
-    fn place(&self, index: u32, key: Option<u64>) -> Option<u32> {
-        let Some(blocks) = self.blocks.as_ref().filter(|b| b.sparse) else {
-            return self.slot(index);
-        };
-        if index >= self.title {
-            return None;
-        }
-        let mut map = blocks.map.lock().unwrap_or_else(|e| e.into_inner());
-        let block = (index / BLOCK) as usize;
-        let (word, bit) = ((index / 64) as usize, 1u64 << (index % 64));
-        #[cfg(feature = "diagnostics")]
-        if key.is_some() {
-            map.touched[block] = stats::now();
-        }
-        if map.host[block] == NONE {
-            let host = if key.is_some() { map.take(block) } else { None };
-            let Some(host) = host else {
-                map.wait(index, key);
-                return None;
-            };
-            blocks.write(block, host * BLOCK);
-        }
-        map.wait(index, None);
-        let view = key.is_some();
-        if view && map.held[word] & bit == 0 {
-            map.held[word] |= bit;
-            map.views[block] += 1;
-        }
-        Some(map.host[block] * BLOCK + index % BLOCK)
-    }
-
-    /// Title slot `index` holds no view any more and its host slot is
-    /// null: a block without views gives its host block back.
-    fn vacate(&self, index: u32) {
-        let Some(blocks) = self.blocks.as_ref().filter(|b| b.sparse) else {
-            return;
-        };
-        let mut map = blocks.map.lock().unwrap_or_else(|e| e.into_inner());
-        let block = (index / BLOCK) as usize;
-        let (word, bit) = ((index / 64) as usize, 1u64 << (index % 64));
-        if map.held[word] & bit != 0 {
-            map.held[word] &= !bit;
-            map.views[block] -= 1;
-        }
-        let host = map.host[block];
-        if map.views[block] == 0 && host != NONE {
-            // Its slots are null by now, each made so when its view went.
-            blocks.write(block, blocks.null);
-            map.host[block] = NONE;
-            map.taken[host as usize] = false;
-            map.free += 1;
-            if map.unplaced > 0 {
-                map.retry = true;
-            }
-        }
-    }
-
-    /// Makes title slots that waited for a host slot (`BlockMap::waiting`)
-    /// where one is there now: in blocks that took a host block for a view
-    /// written since, or that find one given back. A few blocks per call.
-    fn retry(&self, made: &mut [u64]) {
-        if self.blocks.as_ref().is_none_or(|b| !b.sparse) {
-            return;
-        }
-        for _ in 0..RETRY_BLOCKS {
-            let ready = {
-                let blocks = self.blocks.as_ref().expect("checked");
-                blocks.map.lock().unwrap_or_else(|e| e.into_inner()).ready()
-            };
-            let Some(ready) = ready else { return };
-            for (index, key) in ready {
-                // Still the view the title wrote there, unless it went
-                // stale meanwhile (then the slot waits no more).
-                let view = view_at(key as u32, (key >> 32) as u32);
-                let key = if view.is_some() { key } else { 0 };
-                self.set_slot(made, index, key, view.as_ref(), false);
-            }
-        }
-    }
-
-    /// The host slot of title slot `first` if the title slots from it to
-    /// `last` (a table's entries) have host slots in one run, in order: a
-    /// shader given the first reads each at its place.
+    /// The heap index to give a shader for title slot `first` if it finds
+    /// the title slots from there to `last` (a table's entries) counting
+    /// on from it: the title's own, where the heap has those slots in the
+    /// title's order, and where shaders look each index up in the
+    /// view-slot table (a heap that shares its views: they lie apart).
     pub(crate) fn run(&self, first: u32, last: u32) -> Option<u32> {
-        let at = self.slot(first)?;
-        let Some(blocks) = self.blocks.as_ref().filter(|b| b.sparse) else {
-            return (self.slot(last)? >= at).then_some(at);
-        };
-        if last < first || last >= self.title {
-            return None;
-        }
-        #[allow(unused_mut)]
-        let mut map = blocks.map.lock().unwrap_or_else(|e| e.into_inner());
-        let (from, to) = ((first / BLOCK) as usize, (last / BLOCK) as usize);
-        #[cfg(feature = "diagnostics")]
-        map.touched[from..=to].fill(stats::now());
-        (from..=to)
-            .all(|b| map.host[from] != NONE && map.host[b] == map.host[from] + (b - from) as u32)
-            .then_some(at)
+        let slots = if self.slots.is_some() { self.title } else { self.count };
+        (first <= last && last < slots).then_some(first)
     }
 
-    /// Diagnostics: logs how the title blocks and dynamic slots are used,
-    /// over the last `frames` frames.
+    /// After a sync, in a heap that shares its views: the views no title
+    /// slot holds any more give their host slots back (made null: a stale
+    /// index reads nothing, and what the view kept alive may go).
+    pub(crate) fn settle(&self) {
+        if let Some(slots) = &self.slots {
+            self.settle_in(&mut slots.map.lock().unwrap_or_else(|e| e.into_inner()));
+        }
+    }
+
+    fn settle_in(&self, map: &mut SlotMap) {
+        for key in std::mem::take(&mut map.idle) {
+            // Taken up again since, or gone already (it was given up twice).
+            let Some(slot) = map.views.get(&key).filter(|s| s.held == 0).map(|s| s.slot) else {
+                continue;
+            };
+            map.views.remove(&key);
+            map.give(slot);
+            self.make_null(slot);
+            self.note_address(slot, None);
+            count!(FREED);
+        }
+    }
+
+    /// Diagnostics: logs how the title's views and the dynamic slots are
+    /// used, over the last `frames` frames.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn log_stats(&self, frames: f64) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -846,17 +768,18 @@ impl HostHeap {
         }
         let frames = frames.max(1.0);
         let per = |a: &std::sync::atomic::AtomicU64| a.swap(0, Relaxed) as f64 / frames;
-        let (sync_ms, visits, unplaced_visits) = (
+        let (sync_ms, visits, table_views) = (
             per(&stats::SYNC_US) / 1000.0,
             per(&stats::VISITS),
-            per(&stats::UNPLACED_VISITS),
+            per(&stats::TABLE_VIEWS),
         );
         let used_now = stats::DYNAMIC_USED.load(Relaxed);
         let dyn_peak = stats::DYNAMIC_PEAK.swap(used_now, Relaxed);
-        let Some(blocks) = self.blocks.as_ref().filter(|b| b.sparse) else {
+        let Some(slots) = &self.slots else {
             tracing::info!(
                 sync_ms,
                 visits,
+                table_views,
                 dyn_used = used_now,
                 dyn_peak,
                 of = self.dynamic,
@@ -864,99 +787,32 @@ impl HostHeap {
             );
             return;
         };
-        let map = blocks.map.lock().unwrap_or_else(|e| e.into_inner());
-        let used = map.taken.iter().filter(|&&t| t).count();
-        // Mapped blocks by how many views they hold.
-        let mut hist = [0usize; 6];
-        let (mut span, mut wanting) = (0usize, 0usize);
-        // Chunks of 64, 128, 256 and 1024 title slots holding a view (placed
-        // or not): what blocks of that size would need.
-        let mut chunks = [0usize; 4];
-        let words = (BLOCK / 64) as usize;
-        // Blocks with a host block, and blocks waiting for one, by how long
-        // ago a view was written there or a table read: under 1 s, 5 s, 30 s,
-        // more.
-        let (mut mapped_age, mut waiting_age) = ([0usize; 4], [0usize; 4]);
-        let now = stats::now();
-        for b in 0..map.host.len() {
-            let age = now.saturating_sub(map.touched[b]);
-            let bucket = [10, 50, 300].iter().position(|&a| age < a).unwrap_or(3);
-            if map.host[b] != NONE {
-                mapped_age[bucket] += 1;
-            } else if map.waiting_in[b] > 0 {
-                waiting_age[bucket] += 1;
-            }
-        }
-        for b in 0..map.host.len() {
-            let w = &map.held[b * words..((b + 1) * words).min(map.held.len())];
-            let mut any = w.to_vec();
-            if map.waiting_in[b] > 0 {
-                let first = b * BLOCK as usize;
-                for i in first..(first + BLOCK as usize).min(map.waiting.len()) {
-                    if map.waiting[i] != 0 {
-                        any[(i - first) / 64] |= 1 << (i % 64);
-                    }
-                }
-            }
-            if any.iter().any(|&x| x != 0) {
-                wanting += 1;
-            }
-            for (i, k) in [1usize, 2, 4, 16].into_iter().enumerate() {
-                chunks[i] += any.chunks(k).filter(|c| c.iter().any(|&x| x != 0)).count();
-            }
-            if map.host[b] == NONE {
-                continue;
-            }
-            let n = map.views[b];
-            let bucket = match n {
-                0..=1 => 0,
-                2..=4 => 1,
-                5..=32 => 2,
-                33..=128 => 3,
-                129..=512 => 4,
-                _ => 5,
-            };
-            hist[bucket] += 1;
-            let first = w.iter().position(|&x| x != 0);
-            let last = w.iter().rposition(|&x| x != 0);
-            if let (Some(f), Some(l)) = (first, last) {
-                let lo = f * 64 + w[f].trailing_zeros() as usize;
-                let hi = l * 64 + 63 - w[l].leading_zeros() as usize;
-                span += hi + 1 - lo;
-            }
-        }
+        let map = slots.map.lock().unwrap_or_else(|e| e.into_inner());
         tracing::info!(
             sync_ms,
             visits,
-            unplaced_visits,
-            blocks = used,
-            of = map.taken.len(),
-            wanting,
-            unplaced = map.unplaced,
-            mapped_age = ?mapped_age,
-            waiting_age = ?waiting_age,
-            views_1 = hist[0],
-            views_4 = hist[1],
-            views_32 = hist[2],
-            views_128 = hist[3],
-            views_512 = hist[4],
-            views_1024 = hist[5],
-            span,
-            chunks_64 = chunks[0],
-            chunks_128 = chunks[1],
-            chunks_256 = chunks[2],
-            chunks_1024 = chunks[3],
+            views = map.used,
+            of = map.slots,
+            peak = map.peak,
+            title_slots = map.live,
+            shares = f64::from(map.live) / f64::from(map.used.max(1)),
+            table_writes = per(&stats::WRITES),
+            created = per(&stats::CREATED),
+            remade = per(&stats::REMADE),
+            freed = per(&stats::FREED),
+            refused = map.refused,
+            table_views,
             dyn_used = used_now,
             dyn_peak,
             dyn_of = self.dynamic,
-            "host view heap stats (per frame: sync_ms, visits; blocks by views held)"
+            "host view heap stats (distinct host views of capacity, title slots holding one; per frame: sync_ms, visits, table_writes, created, remade, freed, table_views)"
         );
     }
 
-    /// The view-block table, for root SRV `VIEW_BLOCKS`: every view heap of
+    /// The view-slot table, for root SRV `VIEW_SLOTS`: every view heap of
     /// a host whose shaders read one has it.
-    pub(crate) fn blocks(&self) -> Option<&ID3D12Resource> {
-        self.blocks.as_ref().map(|b| &b.table.0)
+    pub(crate) fn slots(&self) -> Option<&ID3D12Resource> {
+        self.slots.as_ref().map(|s| &s.table.0).or(self.order.as_ref())
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
@@ -982,6 +838,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
+        count!(TABLE_VIEWS);
         let (kept, mark, skip) = make_marked(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
@@ -1057,10 +914,11 @@ impl HostHeap {
         }
         self.keep(index, None);
         self.set_stride(index, None, 0);
-        // Unmarked by host slot: a block given back leaves none behind.
+        // Unmarked by host slot: a slot given back leaves none behind.
         self.set_mark(index, None);
-        // A slot of the title's, where they lie in the title's order.
-        if index < self.count && self.blocks.as_ref().is_none_or(|b| !b.sparse) {
+        // A slot of the title's views (what they view is kept by host
+        // slot).
+        if index < self.count {
             self.viewed.set(index, None, false);
         }
     }
@@ -1141,21 +999,33 @@ impl HostHeap {
     /// on first use from the slots made so far.
     pub(crate) fn view_addresses(&self) -> Option<u64> {
         let made = self.addresses.get_or_init(|| {
-            // By host slot. Where shaders find the title's slots by blocks
-            // an index from data leads to any block, the null one too: an
-            // entry for every slot of the heap.
-            let slots = match &self.blocks {
+            // By host slot. Where shaders find the title's views through
+            // the view-slot table an index from data leads to any slot,
+            // the null one too: an entry for every slot of the heap.
+            let entries = if self.slots.is_some() || self.order.is_some() {
                 // SAFETY: a live heap.
-                Some(_) => unsafe { self.heap.GetDesc() }.NumDescriptors,
-                None => self.count,
+                unsafe { self.heap.GetDesc() }.NumDescriptors
+            } else {
+                self.count
             };
-            let (buffer, data) = host()?.upload_buffer(u64::from(slots) * 8)?;
+            let (buffer, data) = host()?.upload_buffer(u64::from(entries) * 8)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
+            // No slot is made meanwhile.
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            for (i, &key) in made.iter().enumerate() {
-                let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
-                write_address(data, i, view.as_ref());
+            let view = |key: u64| (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
+            match &self.slots {
+                Some(slots) => {
+                    let map = slots.map.lock().unwrap_or_else(|e| e.into_inner());
+                    for (&key, shared) in &map.views {
+                        write_address(data, shared.slot as usize, view(key).as_ref());
+                    }
+                }
+                None => {
+                    for (i, &key) in made.iter().enumerate() {
+                        write_address(data, i, view(key).as_ref());
+                    }
+                }
             }
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -1235,10 +1105,10 @@ impl HostHeap {
         }
     }
 
-    /// Makes host slot `index` from the record the title has at `handle`
-    /// if it changed since, and returns the view recorded there. Buffer
-    /// views are made only for draws (`for_draw`), which also copy their
-    /// data: a host copy of a buffer is made on first use.
+    /// Brings title slot `index` up to date with the record the title has
+    /// at `handle` if it changed since, and returns the view recorded
+    /// there. Buffer views are made only for draws (`for_draw`), which
+    /// also copy their data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         let mut raw = [0u8; 12];
         let [tag, i, generation] = if crate::host::read_into(handle as *const u8, &mut raw) {
@@ -1251,28 +1121,56 @@ impl HostHeap {
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let placed = self.set_slot(&mut made, index, key, view.as_ref(), for_draw);
-        self.retry(&mut made);
         if placed { view } else { None }
     }
 
+    /// Makes host slot `slot` from `view`: its descriptor (a null one of
+    /// the view's kind if the host cannot make it, or for a view left for
+    /// later), its stride, mark and address entries, what it views that
+    /// title memory feeds, and the host resource it holds.
+    // shortcut: views of textures the title placed itself are made when a
+    // draw reads them through a table (`later` until then): a host texture
+    // (and a staging copy) for each of the ~20,000 the title has views of
+    // ran the host out of memory (run b2).
+    fn make_slot(&self, slot: u32, view: &View, later: bool) {
+        self.note_address(slot, Some(view));
+        // Shaders index the heap itself (`crate::bindless`): buffer views
+        // are made when written.
+        let (kept, mark, skip) = if later {
+            (None, None, 0)
+        } else {
+            make_marked(view, self.cpu(slot))
+        };
+        // By host slot, as shaders read it: their heap index is the host's
+        // (through the view-slot table where there is one).
+        self.set_stride(slot, Some(view), skip);
+        self.set_mark(slot, mark);
+        if kept.is_none() && !self.sampler {
+            null_for(view, self.cpu(slot));
+        }
+        if !self.sampler {
+            self.viewed.set(slot, Some(view), kept.is_some());
+        }
+        self.keep(slot, kept.flatten());
+    }
+
     /// Brings title slot `index` (its record's `key`, `view` the view it
-    /// names if any) up to date in `made`, which is by host slot. Whether
-    /// the slot has a host slot.
+    /// names if any) up to date in `made`, which is by title slot. Whether
+    /// the slot holds a view that has a host slot.
     fn set_slot(&self, made: &mut [u64], index: u32, key: u64, view: Option<&View>, for_draw: bool) -> bool {
-        #[cfg(feature = "diagnostics")]
-        stats::VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Where the title's slot lies in this heap (`index` is the title's
-        // from here on, `slot` the host's).
-        let Some(slot) = self.place(index, view.is_some().then_some(key)) else {
-            // A title slot the host heap has none for: past a heap the host
-            // caps, or in a block that found no host block free. Shaders
-            // indexing the heap itself read nothing there. That is only
-            // right while the title keeps no view there, so those it
-            // writes are counted (the title also writes null and stale
-            // records over its whole heap, which say nothing).
+        count!(VISITS);
+        if let Some(slots) = &self.slots {
+            return self.share(slots, made, index, key, view, for_draw);
+        }
+        // The title's slot is the host's.
+        let slot = index;
+        if slot >= self.count {
+            // A title slot past a heap the host caps. Shaders indexing the
+            // heap itself read nothing there. That is only right while the
+            // title keeps no view there, so those it writes are counted
+            // (the title also writes null and stale records over its whole
+            // heap, which say nothing).
             if view.is_some() {
-                #[cfg(feature = "diagnostics")]
-                stats::UNPLACED_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let writes = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if writes.is_power_of_two() {
@@ -1286,90 +1184,176 @@ impl HostHeap {
                 }
             }
             return false;
-        };
+        }
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[slot as usize] != 0 {
                 made[slot as usize] = 0;
                 self.make_null(slot);
-                self.viewed.set(index, None, false);
                 self.note_address(slot, None);
             }
-            // A block left without views goes back (its slots are null).
-            self.vacate(index);
-            return true;
+            return false;
         };
         if made[slot as usize] != key {
-            self.note_address(slot, Some(view));
-            // Shaders index the heap itself (`crate::bindless`): buffer views
-            // are made when written.
-            // shortcut: views of textures the title placed itself are made
-            // when a draw reads them through a table: a host texture (and a
-            // staging copy) for each of the ~20,000 the title has views of
-            // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(view);
             made[slot as usize] = if later { 0 } else { key };
-            let (kept, mark, skip) = if later {
-                (None, None, 0)
-            } else {
-                make_marked(view, self.cpu(slot))
-            };
-            // By host slot, as shaders read it: their heap index is the
-            // host's (through the view-block table where there is one).
-            self.set_stride(slot, Some(view), skip);
-            self.set_mark(slot, mark);
-            if kept.is_none() && !self.sampler {
-                null_for(view, self.cpu(slot));
-            }
-            if !self.sampler {
-                self.viewed.set(index, Some(view), kept.is_some());
-            }
-            self.keep(slot, kept.flatten());
+            self.make_slot(slot, view, later);
         }
         true
     }
 
-    /// What `made` holds for title slot `index`, through the block map:
-    /// the key of its view, 1 for a slot the title holds a view in that is
-    /// not made (a placed texture waiting for a draw: it must still be
-    /// visited to be given back), else 0. A block given back leaves none.
-    fn prior(&self, made: &[u64], index: u32) -> u64 {
-        let Some(blocks) = self.blocks.as_ref() else {
-            return made.get(index as usize).copied().unwrap_or(0);
+    /// [`HostHeap::set_slot`] in a heap that shares its views: title slot
+    /// `index` leads to the host slot of the view it holds now, which is
+    /// made if no other title slot holds it yet, and gives up the view it
+    /// held before.
+    fn share(&self, slots: &Slots, made: &mut [u64], index: u32, key: u64, view: Option<&View>, for_draw: bool) -> bool {
+        let Some(&old) = made.get(index as usize) else {
+            return false;
         };
-        if index >= self.title {
-            return 0;
-        }
-        let map = blocks.map.lock().unwrap_or_else(|e| e.into_inner());
-        let host = map.host[(index / BLOCK) as usize];
-        if host != NONE {
-            let key = made[(host * BLOCK + index % BLOCK) as usize];
-            if key != 0 {
-                return key;
+        let key = if view.is_some() { key } else { 0 };
+        let mut map = slots.map.lock().unwrap_or_else(|e| e.into_inner());
+        if old == key {
+            // The same view, by another write or for a draw.
+            if let (Some(view), Some(shared)) = (view, map.views.get_mut(&key)) {
+                self.freshen(shared, view, for_draw);
             }
+            return key != 0;
         }
-        if !blocks.sparse {
-            return 0;
+        // The new view first: one that only moves between title slots
+        // keeps its host slot.
+        let slot = match view {
+            Some(view) => self.acquire(&mut map, key, view, for_draw),
+            None => Some(slots.null),
+        };
+        let (slot, key) = match slot {
+            Some(slot) => (slot, key),
+            None => {
+                // Every host slot holds a view some title slot holds.
+                // Shaders indexing the heap read nothing here; the view is
+                // asked for again when the title next writes its page.
+                map.refused += 1;
+                if map.refused.is_power_of_two() {
+                    tracing::warn!(
+                        index,
+                        count = self.count,
+                        for_draw,
+                        writes = map.refused,
+                        "a title view without a host slot: shaders indexing the heap read nothing there"
+                    );
+                }
+                (slots.null, 0)
+            }
+        };
+        made[index as usize] = key;
+        if map.host[index as usize] != slot {
+            map.host[index as usize] = slot;
+            slots.write(index, slot);
         }
-        // A view waiting for a host slot: unchanged, it is not visited.
-        match map.waiting[index as usize] {
-            0 => u64::from(map.held[(index / 64) as usize] & (1u64 << (index % 64)) != 0),
-            key => key,
+        match (old != 0, key != 0) {
+            (false, true) => map.live += 1,
+            (true, false) => map.live -= 1,
+            _ => {}
         }
+        if old != 0 {
+            map.release(old);
+        }
+        key != 0
+    }
+
+    /// The host slot of the view of record `key`, for one more title slot
+    /// that holds it: the one it has, or a free one it is made in. None
+    /// with every slot taken.
+    fn acquire(&self, map: &mut SlotMap, key: u64, view: &View, for_draw: bool) -> Option<u32> {
+        if let Some(shared) = map.views.get_mut(&key) {
+            shared.held += 1;
+            self.freshen(shared, view, for_draw);
+            return Some(shared.slot);
+        }
+        let slot = match map.take() {
+            Some(slot) => slot,
+            None => {
+                // Those of views no title slot holds any more, first.
+                self.settle_in(map);
+                map.take()?
+            }
+        };
+        let later = !for_draw && is_placed_texture(view);
+        self.make_slot(slot, view, later);
+        let shared = Shared {
+            slot,
+            held: 1,
+            made: !later,
+            buffer: view_stride(view) != 0,
+            // After it is made: that may make its host copy.
+            stamp: crate::shadow::generation(),
+        };
+        map.views.insert(key, shared);
+        count!(CREATED);
+        Some(slot)
+    }
+
+    /// A view some title slot holds already, as another takes it or a draw
+    /// reads it: made now if it was left for a draw, and made again if its
+    /// host resource is no longer the one `view` is made on. A view's
+    /// record outlives what it was made on (a constant buffer's address
+    /// names whichever title buffer lies there, a placed texture's memory
+    /// gets another host texture), and the other title slots that hold it
+    /// read the same host slot.
+    fn freshen(&self, shared: &mut Shared, view: &View, for_draw: bool) {
+        let stale = if !shared.made {
+            for_draw
+        } else if shared.buffer {
+            // Host copies are made and released rarely: only then is the
+            // view's looked up again.
+            let now = crate::shadow::generation();
+            let moved = shared.stamp != now && !self.reads(shared.slot, view, true);
+            shared.stamp = now;
+            moved
+        } else {
+            for_draw && is_placed_texture(view) && !self.reads(shared.slot, view, false)
+        };
+        if stale {
+            self.make_slot(shared.slot, view, false);
+            shared.made = true;
+            count!(REMADE);
+        }
+    }
+
+    /// Whether host slot `slot`, made from `view`, views the host resource
+    /// `view` would be made on now. A buffer view the host could not make
+    /// (`buffer`) is tried again when a copy may be there for it; a
+    /// texture view is left as it is.
+    fn reads(&self, slot: u32, view: &View, buffer: bool) -> bool {
+        use windows::core::Interface;
+        let now = match view {
+            View::Constant(address, size) => {
+                crate::shadow::find(*address, u64::from(*size)).map(|s| s.buffer.as_raw())
+            }
+            _ if buffer => view_copy(view).map(|(shadow, ..)| shadow.buffer.as_raw()),
+            _ => match placed_texture(view) {
+                Some(View::Shader(texture, _)) => {
+                    crate::resource::host_resource(texture as crate::object::This).map(Interface::as_raw)
+                }
+                _ => None,
+            },
+        };
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let held = kept.get(slot as usize).and_then(Option::as_ref).map(|k| k.0.as_raw());
+        held == now || (!buffer && held.is_none())
     }
 
     /// Makes title slots `first..last` from safely copied title bytes `bytes`
     /// (`for_draw = false`), locking `self.made` once and `VIEWS` at most once
     /// (cloning only the views of changed slots).
-    /// Slots are keyed as `mirror` does: by title index through the block
-    /// map, so an unchanged slot is skipped by what its host slot holds now.
+    /// Slots are keyed as `mirror` does, by title index, so an unchanged
+    /// slot is skipped by what it was last made from.
     pub(crate) fn mirror_bytes(&self, first: u32, last: u32, step: u64, bytes: &[u8]) {
-        let end = last.min(if self.blocks.is_some() { self.title } else { self.count });
+        let mut guard = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let end = last.min(guard.len() as u32);
         if first >= end {
             return;
         }
-        let mut guard = self.made.lock().unwrap_or_else(|e| e.into_inner());
         // The changed slots are found under `VIEWS` (cloning only those)
         // and made after it is released: making a view calls back into
         // code that takes `VIEWS` itself (std mutexes do not re-enter).
@@ -1380,27 +1364,26 @@ impl HostHeap {
             end,
             step,
             bytes,
-            |made, index| self.prior(made, index),
+            |made, index| made[index as usize],
             |_, index, key, view| changed.push((index, key, view.cloned())),
         );
         for (index, key, view) in changed {
             self.set_slot(&mut guard, index, key, view.as_ref(), false);
         }
-        self.retry(&mut guard);
     }
 
-    /// The view host slot `index` was made from, in a few words, with the
+    /// The view title slot `index` was made from, in a few words, with the
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let Some(index) = self.slot(index) else {
+        let Some(slot) = self.slot(index) else {
             return (index < self.title).then(|| "null".into());
         };
         let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
         // A view the host could not make leaves a null view, its record
         // noted all the same; it keeps no resource.
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(slot as usize).is_some_and(Option::is_some);
         if key == 0 || (!kept && !self.sampler) {
             return Some("null".into());
         }
@@ -1413,10 +1396,17 @@ impl HostHeap {
         Some(text)
     }
 
-    /// Whether slot `index` was made from a record (tests).
+    /// Whether title slot `index` holds a view made on the host (tests).
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
-        self.slot(index).is_some_and(|slot| self.made.lock().unwrap_or_else(|e| e.into_inner())[slot as usize] != 0)
+        let key = self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize];
+        match &self.slots {
+            Some(slots) => {
+                let map = slots.map.lock().unwrap_or_else(|e| e.into_inner());
+                map.views.get(&key).is_some_and(|shared| shared.made)
+            }
+            None => key != 0,
+        }
     }
 }
 
@@ -2502,8 +2492,7 @@ mod tests {
             crate::host::release_retired();
             assert_eq!(references(&buffer), 1, "ours");
         }
-        // Dynamic slots follow those for the title's (its 4, or a block of
-        // them and a null one where the host caps its view heaps).
+        // Dynamic slots follow those for the title's.
         let first = heap.count();
         let a = heap.dynamic(heap.dynamic - 100).unwrap();
         let b = heap.dynamic(60).unwrap();
@@ -2517,11 +2506,10 @@ mod tests {
 
     /// A heap on a host that makes none larger (as NVIDIA's 1,000,000
     /// slots, here 65,536) has every slot a shader translated for it can
-    /// index: blocks for the title's slots, the dynamic range, slots for
+    /// index: slots for the title's views, the dynamic range, slots for
     /// view pairs, then the null buffer views and the clamp's slot.
     #[test]
     fn a_capped_heap_keeps_dynamic_slots_pairs_and_null_views() {
-        // 831 blocks for the title's slots and a null one.
         assert_eq!(
             capped_layout(PORTABLE_VIEWS),
             (852_541, CAPPED_DYNAMIC, CAPPED_PAIRS)
@@ -2535,121 +2523,123 @@ mod tests {
         let heap = HostHeap::sized(false, 100_000, views).unwrap();
         // SAFETY: a plain query of a live heap.
         assert_eq!(unsafe { heap.heap.GetDesc() }.NumDescriptors, views);
-        // 23 blocks for the title's 98, and the null block.
-        assert_eq!((heap.count(), heap.dynamic), (24 * BLOCK, 32_766));
+        // 24,577 slots for the views of the title's 100,000.
+        assert_eq!((heap.count(), heap.dynamic), (24_577, 32_766));
         // The whole dynamic range in one run, then nothing until released.
-        assert_eq!(heap.dynamic(32_766), Some(24 * BLOCK));
+        assert_eq!(heap.dynamic(32_766), Some(24_577));
         assert_eq!(heap.dynamic(1), None);
         // Pairs past it, below the null views; then from the dynamic slots.
-        let first = 24 * BLOCK + 32_766;
+        let first = 24_577 + 32_766;
         let pairs: Vec<u32> = (0..(views - 3 - first) / 2).map(|_| heap.pair().unwrap()).collect();
         assert_eq!(pairs[0], first);
         assert!(pairs[pairs.len() - 1] + 2 <= views - 3 && pairs.len() > 4000);
         assert_eq!(heap.pair(), None);
-        heap.release(24 * BLOCK, 32_766);
-        assert_eq!(heap.pair(), Some(24 * BLOCK));
+        heap.release(24_577, 32_766);
+        assert_eq!(heap.pair(), Some(24_577));
         // The null buffer views (raw: 4-byte elements) are where shaders
         // translated for such a heap read them, the last slot left null.
         let (_, strides) = heap.strides.as_ref().unwrap();
         // SAFETY: dwords of the mapped table, which covers these indices.
         let stride = |index: u32| unsafe { (*strides as *const u32).add(index as usize).read_volatile() };
         assert_eq!([stride(views - 3), stride(views - 2), stride(views - 1)], [4, 4, 0]);
-        // A smaller title heap keeps the title's order: its block, the
-        // null block, the dynamic slots, and the rest are pairs'.
+        // A smaller title heap keeps the title's order (its table says
+        // so, for its slots and the host's own, which tables made afresh
+        // lie in): its 4 slots, the dynamic slots, and the rest are pairs'.
         let small = HostHeap::sized(false, 4, views).unwrap();
-        assert_eq!((small.count(), small.dynamic, small.pair()), (2 * BLOCK, 32_766, Some(2 * BLOCK + 32_766)));
+        assert_eq!((small.count(), small.dynamic, small.pair()), (4, 32_766, Some(4 + 32_766)));
         assert_eq!((small.slot(3), small.slot(4), small.run(0, 3), small.run(2, 4)), (Some(3), None, Some(0), None));
+        assert!(small.slots.is_none() && small.slots().is_some());
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
-    /// On a host that caps its view heaps, a title heap with more slots
-    /// than fit gets host slots by blocks, as it writes views: a view far
-    /// past the host's slots is where a shader indexing the heap finds it
-    /// (the view-block table, then the view-stride table) and where a
-    /// table over it is told to read; a block gives its host block back
-    /// with its last view.
-    #[test]
-    fn a_capped_heap_holds_the_titles_slots_by_blocks() {
-        if host().is_none() {
-            return; // no host GPU
-        }
-        let heap = HostHeap::sized(false, 100_000, 1 << 16).unwrap();
-        let blocks = heap.blocks.as_ref().unwrap();
-        // SAFETY: a dword of the mapped block table, which covers these blocks.
-        let entry = |block: u32| unsafe { (blocks.table.1 as *const u32).add(block as usize).read_volatile() };
-        // SAFETY: a dword of the mapped stride table, which covers these slots.
-        let stride = |slot: u32| unsafe { (heap.strides.as_ref().unwrap().1 as *const u32).add(slot as usize).read_volatile() };
-        // What a shader computes for the title's index.
-        let shader = |index: u32| entry(index / BLOCK) + index % BLOCK;
-        let null = 23 * BLOCK;
-        assert_eq!((entry(0), entry(97), entry(2047)), (null, null, null));
-        // The title's descriptors: constant buffer views (raw buffer views
-        // on the host, 4-byte elements) at its slots 90,000, 90,113 (the
-        // next block) and 5, and nothing at 90,001.
-        let mut records = vec![[0u32; 8]; 4];
-        let records = records.as_mut_ptr() as u64;
-        let handle = |k: usize| records + 32 * k as u64;
-        for k in [0, 1, 2] {
-            crate::descriptor::create_cbv(std::ptr::null(), &[0x1000 * (k as u32 + 1), 1, 256, 0], handle(k));
-        }
-        assert!(heap.mirror(90_000, handle(0), false).is_some());
-        assert!(heap.mirror(90_001, handle(3), false).is_none());
-        let first = heap.slot(90_000).unwrap();
-        assert_eq!(first, 90_000 % BLOCK, "the first block taken is the heap's first");
-        assert_eq!((shader(90_000), stride(first)), (first, 4), "through the heap itself");
-        assert_eq!(shader(90_001), first + 1);
-        assert_eq!(stride(first + 1), 0, "no view: the shader reads the null buffer view");
-        assert_eq!(heap.run(90_000, 90_001), Some(first), "through a table");
-        // A table reaching into a block without host slots is not there.
-        assert_eq!(heap.run(90_000, 90_113), None);
-        assert_eq!(shader(90_113), null + 90_113 % BLOCK);
-        // The next title block lies after its predecessor.
-        assert!(heap.mirror(90_113, handle(1), false).is_some());
-        assert_eq!(heap.run(90_000, 90_113), Some(first));
-        assert_eq!(shader(90_113), first + 113);
-        // A block elsewhere takes the first of another group of blocks.
-        assert!(heap.mirror(5, handle(2), false).is_some());
-        assert_eq!(shader(5), GROUP as u32 * BLOCK + 5);
-        assert_eq!(heap.run(5, 90_000), None);
-        assert_eq!(heap.slot(100_000), None, "past the title's heap");
-        // View marks are kept by host slot, as shaders read them.
-        // SAFETY: two dwords of the mapped mark table, which covers these slots.
-        let mark = |slot: u32| unsafe { (heap.marks.as_ref().unwrap().1 as *const u32).add(2 * slot as usize).read_volatile() };
-        heap.set_mark(GROUP as u32 * BLOCK + 5, Some((7, 0)));
-        // The title overwrites its view with nothing: the block is given
-        // back, and shaders read null slots there, unmarked.
-        // SAFETY: a record of ours.
-        unsafe { (handle(2) as *mut [u32; 3]).write([0; 3]) };
-        assert!(heap.mirror(5, handle(2), false).is_none());
-        assert_eq!((heap.slot(5), shader(5)), (None, null + 5));
-        assert_eq!(stride(GROUP as u32 * BLOCK + 5), 0);
-        assert_eq!(mark(GROUP as u32 * BLOCK + 5), victory_shader::emit::VIEW_MARK_NONE);
-        assert_eq!(heap.slot(90_000), Some(first));
-        // With every host block taken, a view in another block has no
-        // slot; one in a block that has its host block does.
-        for block in 0..23 {
-            heap.mirror(block * BLOCK, handle(0), false);
-        }
-        assert_eq!(heap.slot(87 * BLOCK), Some(0));
-        assert!(heap.slot(22 * BLOCK).is_none() && heap.slot(20 * BLOCK).is_some());
-        assert!(heap.mirror(22 * BLOCK, handle(0), false).is_none());
-        assert_eq!(shader(22 * BLOCK), null);
+    /// The title's records `n` of 32 bytes, zeroed, and their handles.
+    fn records(n: usize) -> (Vec<[u32; 8]>, impl Fn(usize) -> u64) {
+        let mut records = vec![[0u32; 8]; n];
+        let start = records.as_mut_ptr() as u64;
+        (records, move |k: usize| start + 32 * k as u64)
     }
 
-    /// The bulk sync keys slots by title index through the block map: a
-    /// view in a capped heap is made, found unchanged without a remake, and
-    /// its block goes back (leaving nothing "made") when the title writes
-    /// nothing there; the next tenant of that host block starts clean.
+    /// On a host that caps its view heaps, each distinct view of the
+    /// title's has one host slot however many of the title's slots hold
+    /// it: a shader finds it through the view-slot table (then the
+    /// view-stride table, by host slot), a slot without a view leads to
+    /// the null slot, and a table is read where the title has it. The host
+    /// slot goes back, null and unmarked, when the last title slot gives
+    /// the view up and the sync is over.
     #[test]
-    fn bulk_mirror_follows_the_block_map() {
+    fn a_capped_heap_holds_each_distinct_view_once() {
+        if host().is_none() {
+            return; // no host GPU
+        }
+        let views = 1 << 16;
+        let heap = HostHeap::sized(false, 100_000, views).unwrap();
+        let slots = heap.slots.as_ref().unwrap();
+        // SAFETY: a dword of the mapped slot table, which covers these slots.
+        let entry = |index: u32| unsafe { (slots.table.1 as *const u32).add(index as usize).read_volatile() };
+        // SAFETY: a dword of the mapped stride table, which covers these slots.
+        let stride = |slot: u32| unsafe { (heap.strides.as_ref().unwrap().1 as *const u32).add(slot as usize).read_volatile() };
+        // SAFETY: two dwords of the mapped mark table, which covers these slots.
+        let mark = |slot: u32| unsafe { (heap.marks.as_ref().unwrap().1 as *const u32).add(2 * slot as usize).read_volatile() };
+        let null = views - 1;
+        let last = victory_shader::emit::HEAP_VIEWS - 1;
+        assert_eq!((entry(0), entry(99_999), entry(last)), (null, null, null));
+        // The title's descriptors: constant buffer views (raw buffer views
+        // on the host, 4-byte elements), records 0 and 2 of the same one,
+        // and nothing in record 3.
+        let (_records, handle) = records(4);
+        for (k, address) in [(0, 0x1000), (1, 0x2000), (2, 0x1000)] {
+            crate::descriptor::create_cbv(std::ptr::null(), &[address, 1, 256, 0], handle(k));
+        }
+        assert!(heap.mirror(90_000, handle(0), false).is_some());
+        assert!(heap.mirror(90_001, handle(1), false).is_some());
+        assert!(heap.mirror(7, handle(2), false).is_some());
+        assert!(heap.mirror(90_002, handle(3), false).is_none());
+        let (a, b) = (heap.slot(90_000).unwrap(), heap.slot(90_001).unwrap());
+        assert_eq!((a, b), (0, 1), "host slots in the order the views came");
+        assert_eq!((entry(90_000), entry(90_001), entry(7), entry(90_002)), (a, b, a, null));
+        assert_eq!((stride(a), stride(b), stride(null)), (4, 4, 0));
+        {
+            let map = slots.map.lock().unwrap();
+            assert_eq!((map.used, map.live, map.views.len()), (2, 3, 2));
+        }
+        // Through a table: at the title's index, wherever its views lie.
+        assert_eq!((heap.run(90_000, 90_002), heap.run(6, 7)), (Some(90_000), Some(6)));
+        assert_eq!(heap.run(99_999, 100_000), None, "past the title's heap");
+        assert_eq!(heap.slot(100_000), None);
+        // View marks are kept by host slot, as shaders read them.
+        heap.set_mark(b, Some((7, 0)));
+        // One of the two title slots holding a view gives it up: the other
+        // still reads it.
+        // SAFETY: a record of ours.
+        unsafe { (handle(0) as *mut [u32; 3]).write([0; 3]) };
+        assert!(heap.mirror(90_000, handle(0), false).is_none());
+        heap.settle();
+        assert_eq!((entry(90_000), entry(7), stride(a)), (null, a, 4));
+        // The only title slot holding the other gives it up: the view
+        // stays until the sync is over, then its slot is null and free.
+        // SAFETY: a record of ours.
+        unsafe { (handle(1) as *mut [u32; 3]).write([0; 3]) };
+        assert!(heap.mirror(90_001, handle(1), false).is_none());
+        assert_eq!((entry(90_001), stride(b)), (null, 4));
+        heap.settle();
+        assert_eq!((stride(b), mark(b)), (0, victory_shader::emit::VIEW_MARK_NONE));
+        let map = slots.map.lock().unwrap();
+        assert_eq!((map.used, map.live, map.views.len()), (1, 1, 1));
+    }
+
+    /// The bulk sync keys slots by title index: a view in a capped heap is
+    /// made, found unchanged without a remake, keeps its host slot when it
+    /// moves to another title slot within a sync, and gives it back when
+    /// the title writes nothing there.
+    #[test]
+    fn bulk_mirror_follows_the_slot_table() {
         if host().is_none() {
             return; // no host GPU
         }
         let heap = HostHeap::sized(false, 100_000, 1 << 16).unwrap();
-        let mut records = vec![[0u32; 8]; 2];
-        let records = records.as_mut_ptr() as u64;
-        crate::descriptor::create_cbv(std::ptr::null(), &[0x1000, 1, 256, 0], records);
+        let (_records, handle) = records(2);
+        crate::descriptor::create_cbv(std::ptr::null(), &[0x1000, 1, 256, 0], handle(0));
         let bytes = |at: u64| {
             let mut b = [0u8; 12];
             // SAFETY: 12 bytes of a record of ours.
@@ -2657,78 +2647,25 @@ mod tests {
             b
         };
         let index = 90_000;
-        heap.mirror_bytes(index, index + 1, 32, &bytes(records));
+        heap.mirror_bytes(index, index + 1, 32, &bytes(handle(0)));
         assert!(heap.made(index));
         let slot = heap.slot(index).unwrap();
-        let key = heap.made.lock().unwrap()[slot as usize];
-        // Unchanged: skipped, still made at the same host slot.
-        heap.mirror_bytes(index, index + 1, 32, &bytes(records));
-        assert_eq!((heap.slot(index), heap.made.lock().unwrap()[slot as usize]), (Some(slot), key));
-        // The title writes nothing there: made cleared, block given back.
-        heap.mirror_bytes(index, index + 1, 32, &bytes(records + 32));
-        assert!(!heap.made(index) && heap.slot(index).is_none());
-        assert_eq!(heap.made.lock().unwrap()[slot as usize], 0);
-    }
-
-    /// With every host block taken, a view in another block waits for one:
-    /// the sync skips it while the title leaves it unchanged (no search of
-    /// the full heap on every visit), and it is made, where shaders find it,
-    /// as soon as a block is given back; a view that went stale meanwhile
-    /// waits no more.
-    #[test]
-    fn a_view_without_a_host_block_waits_for_one() {
-        if host().is_none() {
-            return; // no host GPU
-        }
-        let heap = HostHeap::sized(false, 100_000, 1 << 16).unwrap();
-        let blocks = heap.blocks.as_ref().unwrap();
-        let mut records = vec![[0u32; 8]; 3];
-        let records = records.as_mut_ptr() as u64;
-        for k in [0, 1] {
-            crate::descriptor::create_cbv(
-                std::ptr::null(),
-                &[0x1000 * (k + 1), 1, 256, 0],
-                records + 32 * u64::from(k),
-            );
-        }
-        let bytes = |at: u64| {
-            let mut b = [0u8; 12];
-            // SAFETY: 12 bytes of a record of ours.
-            unsafe { std::ptr::copy_nonoverlapping(at as *const u8, b.as_mut_ptr(), 12) };
-            b
-        };
-        // All 23 host blocks taken.
-        for block in 0..23 {
-            heap.mirror_bytes(block * BLOCK, block * BLOCK + 1, 32, &bytes(records));
-        }
-        let (waiting, other) = (50 * BLOCK + 7, 60 * BLOCK);
-        heap.mirror_bytes(waiting, waiting + 1, 32, &bytes(records + 32));
-        heap.mirror_bytes(other, other + 1, 32, &bytes(records + 32));
-        assert_eq!((heap.slot(waiting), heap.slot(other)), (None, None));
-        let key = {
-            let map = blocks.map.lock().unwrap();
-            assert_eq!((map.free, map.unplaced), (0, 2));
-            map.waiting[waiting as usize]
-        };
-        assert_ne!(key, 0);
-        // Unchanged, it reads as made: the sync passes it by.
-        assert_eq!(heap.prior(&heap.made.lock().unwrap(), waiting), key);
-        // The view at `other` goes stale while it waits.
-        heap.mirror_bytes(other, other + 1, 32, &bytes(records + 64));
-        // The title writes nothing at block 3's view: its host block is
-        // given back and taken by the waiting view's block.
-        let freed = heap.slot(3 * BLOCK).unwrap() / BLOCK;
-        heap.mirror_bytes(3 * BLOCK, 3 * BLOCK + 1, 32, &bytes(records + 64));
-        assert_eq!(heap.slot(waiting), Some(freed * BLOCK + 7));
-        assert!(heap.made(waiting));
-        // SAFETY: a dword of the mapped block table.
-        let entry = unsafe { (blocks.table.1 as *const u32).add(50).read_volatile() };
-        assert_eq!(entry, freed * BLOCK);
-        let map = blocks.map.lock().unwrap();
-        assert_eq!(
-            (map.free, map.unplaced, map.waiting[other as usize]),
-            (0, 0, 0)
-        );
+        let key = heap.made.lock().unwrap()[index as usize];
+        // Unchanged: skipped, still at the same host slot.
+        heap.mirror_bytes(index, index + 1, 32, &bytes(handle(0)));
+        assert_eq!((heap.slot(index), heap.made.lock().unwrap()[index as usize]), (Some(slot), key));
+        // The title moves it to slot 5: the same host slot, not made again.
+        heap.mirror_bytes(index, index + 1, 32, &bytes(handle(1)));
+        heap.mirror_bytes(5, 6, 32, &bytes(handle(0)));
+        heap.settle();
+        assert_eq!((heap.slot(index), heap.slot(5)), (None, Some(slot)));
+        assert!(!heap.made(index) && heap.made(5));
+        // The title writes nothing there: the host slot is given back.
+        heap.mirror_bytes(5, 6, 32, &bytes(handle(1)));
+        heap.settle();
+        assert!(!heap.made(5) && heap.slot(5).is_none());
+        let map = heap.slots.as_ref().unwrap().map.lock().unwrap();
+        assert_eq!((map.used, map.live, map.views.len()), (0, 0, 0));
     }
 
     /// A host texture of `format` that allows unordered access, made as
@@ -2815,8 +2752,7 @@ mod tests {
         let left = heap.dynamic(2).unwrap();
         let right = heap.dynamic(2).unwrap();
         let rest = heap.dynamic(heap.dynamic - 5).unwrap();
-        // Dynamic slots follow those for the title's (its 4, or a block of
-        // them and a null one where the host caps its view heaps).
+        // Dynamic slots follow those for the title's.
         let base = heap.count();
         assert_eq!((first, left, right, rest), (base, base + 1, base + 3, base + 5));
 

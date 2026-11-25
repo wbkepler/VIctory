@@ -9,7 +9,7 @@ use windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC;
 
 use super::host::{Dispatch, Host, Root, Stride, View};
 use super::{
-    HostShader, StaticSampler, VIEW_BLOCK_SHIFT, VIEW_BLOCKS, VIEW_SKIP_SHIFT, VIEW_STRIDES, lower,
+    HostShader, StaticSampler, VIEW_SKIP_SHIFT, VIEW_SLOTS, VIEW_STRIDES, lower,
     validator,
 };
 use crate::native::{
@@ -790,12 +790,13 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
-/// On a host whose view heaps hold the title's slots by blocks (`emit`,
-/// "Heap indices"), an index a shader takes from the resource heap itself
-/// is the title's: the view-block table leads it to the host's slot. Here
-/// title slot 3 x 1,024 + 1, past the host's heap, lies at host slot 1.
+/// On a host whose view heaps hold the title's views wherever a slot was
+/// free (`emit`, "Heap indices"), a view heap index a shader computes is the
+/// title's, from the resource heap itself or through a table: the view-slot
+/// table leads it to the host's slot. Here the view of title slot 5 lies at
+/// host slot 1, and that of the table's slot 0 at host slot 0.
 #[test]
-fn a_heap_index_goes_through_the_view_block_table() {
+fn a_heap_index_goes_through_the_view_slot_table() {
     let layout = || {
         vec![
             param(RootType::Constants, 0),
@@ -807,7 +808,7 @@ fn a_heap_index_goes_through_the_view_block_table() {
     super::shader::TEST_VIEW_HEAP.set(Some((super::HEAP_VIEWS, true)));
     let shader = build(HEAP_CONSTANT_WAVE32, layout(), vec![entry(ResourceType::Uav, 4, 2)], 32);
     super::shader::TEST_VIEW_HEAP.set(None);
-    assert_eq!(shader.root_srvs, [VIEW_BLOCKS, VIEW_STRIDES]);
+    assert_eq!(shader.root_srvs, [VIEW_SLOTS, VIEW_STRIDES]);
     assert_ne!(shader.dxil, plain.dxil);
     assert_eq!(shader.user_data, plain.user_data, "the same root arguments");
     let data: Vec<u32> = vec![7, 8, 9, 10];
@@ -818,7 +819,7 @@ fn a_heap_index_goes_through_the_view_block_table() {
             stride: Stride::Raw,
         },
     ];
-    let title = (3 << VIEW_BLOCK_SHIFT) + 1;
+    let title = 5;
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -835,7 +836,7 @@ fn a_heap_index_goes_through_the_view_block_table() {
         for u in &shader.user_data {
             ud[u.index as usize] = match u.root {
                 // The constants are at the title's heap index `title`; the
-                // UAV's table is at the host's index 0.
+                // UAV's table is at the title's index 0.
                 RootType::Constants => title,
                 RootType::Table => 0,
                 other => panic!("unexpected user data {other:?}"),
@@ -846,13 +847,13 @@ fn a_heap_index_goes_through_the_view_block_table() {
                 &root,
                 &pso,
                 &Dispatch {
-                    // User data, the block table (the title's block 3 starts
-                    // at host slot 0; the other entries lead nowhere a view
-                    // is), then the stride table: host slot 1 holds a buffer
-                    // view.
+                    // User data, the slot table (the title's slot 5 lies at
+                    // host slot 1, its slot 0 at host slot 0; the other
+                    // entries lead nowhere a view is), then the stride
+                    // table: host slot 1 holds a buffer view.
                     roots: vec![
                         (0, Root::Constants(ud)),
-                        (1, Root::View { srv: true, data: vec![2, 2, 2, 0] }),
+                        (1, Root::View { srv: true, data: vec![0, 2, 2, 2, 2, 1] }),
                         (2, Root::View { srv: true, data: vec![4, 4] }),
                     ],
                     views: &views,
