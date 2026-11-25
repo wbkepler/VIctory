@@ -616,6 +616,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         return false;
     };
     let shown = shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[]));
+    flush_shown(&shown);
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -663,12 +664,23 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let shown = shown_at(pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[]));
+    flush_shown(&shown);
     Some(PageWindow {
         view: View::map(slice, *n)?,
         within: offset % PAGE,
         len,
-        shown: shown_at(pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[])),
+        shown,
     })
+}
+
+/// Before writing physical pages through our own views: what the GPU wrote
+/// there that title memory does not have yet (the GPU side's lazy
+/// copy-back) goes in first, at the title views showing them.
+fn flush_shown(shown: &[usize]) {
+    for &page in shown {
+        victory_gpu::flush_gpu_writes(page, PAGE);
+    }
 }
 
 /// Maps `n` pages at `address`, in place of what is mapped there; null

@@ -312,6 +312,8 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        // A pending page first (lazy copy-back).
+        lazy::flush_range(page, PAGE, lazy::Path::CopyBack);
         if let Some(t) = &self.tracked
             && t.changed(page / PAGE)
         {
@@ -577,6 +579,22 @@ impl Shadow {
     }
 
     fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
+        if back && lazy::on() {
+            // Pending pages under a snapshot first (lazy copy-back): then
+            // title memory differs from the copy by this submission's bytes
+            // alone. (Marked ranges have none: their pages stay pending.)
+            let (from, to) = self.inside(address, len);
+            let snapshotted = self
+                .before
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .0
+                .iter()
+                .any(|(at, bytes)| *at <= from && to <= at + bytes.len());
+            if snapshotted && from < to {
+                lazy::flush_range(self.start as usize + from, to - from, lazy::Path::CopyBack);
+            }
+        }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
         let mut written = 0;
@@ -1104,6 +1122,10 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
         {
             continue;
         }
+        // Lazy copy-back: the page waits, hidden, for the CPU's first look.
+        if lazy::on() && lazy::defer(&copy, page) {
+            continue;
+        }
         let written = copy.copy_back_marked(page);
         #[cfg(feature = "diagnostics")]
         {
@@ -1291,7 +1313,10 @@ fn register_as(resource: usize, start: u64, len: u64, read_only: bool) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
+    let removed = buffers().remove(&(start, resource));
+    if let Some(Entry { shadow: Some(copy), .. }) = removed {
+        // Its memory may go next: what the GPU wrote goes there first.
+        lazy::flush_copy(&copy);
         changed();
     }
 }
@@ -1525,6 +1550,435 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// Lazy copy-back (`VICTORY_LAZY_COPY_BACK=1`): a page shaders marked as
+/// written through views of a copy does not go back into title memory
+/// after the submission. Its title mappings (every address showing it) are
+/// hidden instead (no access), and the copy keeps the GPU's bytes: the
+/// page is pending. The first CPU access faults ([`fault`]) and runs the
+/// page's copy-back ([`Shadow::copy_back_marked`]), then the access runs
+/// again. Writers that do not fault (the kernel, our own reads and writes
+/// of title memory, mappings, new trackers) bring pending pages in their
+/// range back first ([`flush_range`]).
+///
+/// While a page is pending, title memory there is the copy as it was before
+/// the first submission that wrote it (the title cannot write it), so the
+/// copy-back's comparison finds every byte the GPU wrote since, however
+/// many submissions marked it again. Only pages one tracker (the copy's)
+/// holds are deferred, so no other copy or texture reads title memory
+/// there; a tracker made later brings them back first.
+///
+/// shortcut: a page pending when a later submission's writes to it are
+/// withheld (shaders read memory with no copy) puts those back with the
+/// earlier ones. The kernel reading a pending page for the title (a
+/// `WriteFile` from it) fails instead of faulting.
+pub(crate) mod lazy {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+    use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+
+    use super::Shadow;
+    use crate::watch::PAGE;
+
+    /// Whether copy-backs of marked pages wait for the CPU's first look.
+    pub(crate) fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("VICTORY_LAZY_COPY_BACK").as_deref() == Ok("1"))
+    }
+
+    /// Where pending pages were brought back from.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Path {
+        /// A CPU access faulted on a hidden page.
+        Fault,
+        /// The kernel or our own write into title memory ([`crate::watch::writing`]).
+        KernelWrite,
+        /// Memory mapped or unmapped there.
+        Remap,
+        /// The pages mapped at another address too.
+        Alias,
+        /// A new tracker (copy, texture, heap) of the memory.
+        Track,
+        /// Our own reads of title memory (`crate::host::read_into`).
+        HostRead,
+        /// Our own copies from title memory (`crate::host::copy_mapped`).
+        HostCopy,
+        /// DirectStorage writing the physical pages through its own views.
+        Physical,
+        /// The title released a buffer whose copy holds pending pages.
+        Unregister,
+        /// A copy-back of declared ranges or computed addresses there.
+        CopyBack,
+    }
+
+    const PATHS: [&str; 10] = [
+        "CPU faults",
+        "kernel writes",
+        "remaps",
+        "new aliases",
+        "new trackers",
+        "host reads",
+        "host copies",
+        "physical-page writes",
+        "released buffers",
+        "other copy-backs",
+    ];
+
+    /// A pending page: the copies (and their page) holding its GPU bytes,
+    /// the pages hidden (it and its other mappings, page numbers), the
+    /// thread bringing it back if one is, and the frame it was deferred in.
+    struct Group {
+        copies: Vec<(Arc<Shadow>, usize)>,
+        pages: Vec<usize>,
+        busy: Option<usize>,
+        frame: u64,
+    }
+
+    #[derive(Default)]
+    struct Lazy {
+        /// By page (address).
+        groups: HashMap<usize, Group>,
+        /// Each hidden page (page number): its group. Ordered: the hooks ask
+        /// for ranges (every refresh copy and read of title memory).
+        at: std::collections::BTreeMap<usize, usize>,
+    }
+
+    static LAZY: LazyLock<std::sync::RwLock<Lazy>> = LazyLock::new(Default::default);
+
+    fn lazy() -> std::sync::RwLockWriteGuard<'static, Lazy> {
+        LAZY.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lazy_read() -> std::sync::RwLockReadGuard<'static, Lazy> {
+        LAZY.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Pending pages (groups): the hooks cost nothing when there are none.
+    pub(super) static PENDING: AtomicUsize = AtomicUsize::new(0);
+
+    /// Counters since the last log line (some logged by diagnostics only).
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    enum K {
+        Deferred,
+        Remarked,
+        Shared,
+        Other,
+        FlushUs,
+        GateUs,
+        FaultSubmit,
+        Age0,
+        Age1,
+        AgeMore,
+        AgeFrames,
+        AtPresent,
+        Presents,
+    }
+    const COUNTERS: usize = 13;
+    static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+    static FLUSHED: [AtomicU64; PATHS.len()] = [const { AtomicU64::new(0) }; PATHS.len()];
+
+    fn add(k: K, n: u64) {
+        COUNT[k as usize].fetch_add(n, Relaxed);
+    }
+
+    /// This thread, as a number.
+    fn me() -> usize {
+        thread_local! { static ME: u8 = const { 0 }; }
+        ME.with(|m| std::ptr::from_ref(m) as usize)
+    }
+
+    thread_local! {
+        /// This thread submits or holds [`GATE`]: its copy-backs need no
+        /// wait for the GPU.
+        static GATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Held while the GPU runs a submission, and by lazy copy-backs on
+    /// other threads than the submitting one: those write copies, which a
+    /// running submission's shaders may be writing.
+    static GATE: Mutex<()> = Mutex::new(());
+
+    /// Frames presented so far (diagnostics; 0 otherwise).
+    fn frame_now() -> u64 {
+        #[cfg(feature = "diagnostics")]
+        return crate::queue::presented();
+        #[cfg(not(feature = "diagnostics"))]
+        0
+    }
+
+    /// The submitting thread, while it holds the submission lock.
+    pub(crate) struct Submitting(bool);
+
+    impl Submitting {
+        pub(crate) fn enter() -> Self {
+            Submitting(GATED.replace(true))
+        }
+    }
+
+    impl Drop for Submitting {
+        fn drop(&mut self) {
+            GATED.set(self.0);
+        }
+    }
+
+    /// While the GPU runs a submission (lazy copy-back on).
+    pub(crate) fn gpu_running() -> Option<MutexGuard<'static, ()>> {
+        on().then(|| GATE.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// [`GATE`] for a copy-back on this thread, unless it has it already.
+    struct Gate(Option<MutexGuard<'static, ()>>);
+
+    impl Gate {
+        fn take() -> Self {
+            if GATED.get() {
+                return Gate(None);
+            }
+            let waited = std::time::Instant::now();
+            let guard = GATE.lock().unwrap_or_else(|e| e.into_inner());
+            add(K::GateUs, waited.elapsed().as_micros() as u64);
+            GATED.set(true);
+            Gate(Some(guard))
+        }
+    }
+
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            if self.0.is_some() {
+                GATED.set(false);
+            }
+        }
+    }
+
+    /// After a submission (its marked pages pulled into the mirrors): the
+    /// marked page at `page` of `copy` waits, hidden, instead of going back.
+    /// False where it must go back now: the title wrote it during the
+    /// submission, another tracker or mapping holds it, it is not whole in
+    /// the copy, or it cannot be hidden.
+    pub(crate) fn defer(copy: &Arc<Shadow>, page: usize) -> bool {
+        let me = me();
+        loop {
+            let mut l = lazy();
+            let Some(&c) = l.at.get(&(page / PAGE)) else {
+                break;
+            };
+            let g = l.groups.get_mut(&c).expect("indexed pages have their group");
+            if g.busy.is_none() {
+                // Marked again while pending: still pending, title memory
+                // still as before the first of them.
+                if !g.copies.iter().any(|(x, p)| Arc::ptr_eq(x, copy) && *p == page) {
+                    g.copies.push((copy.clone(), page));
+                }
+                add(K::Remarked, 1);
+                return true;
+            }
+            drop(l);
+            // Another thread brings it back: then it goes as any page.
+            std::thread::yield_now();
+        }
+        let Some(t) = &copy.tracked else {
+            return false;
+        };
+        let (start, end) = (copy.start as usize, (copy.start + copy.len) as usize);
+        if page < start || page + PAGE > end || t.has_saved(page / PAGE) || t.changed(page / PAGE) {
+            add(K::Other, 1);
+            return false;
+        }
+        // Indexed (busy) before it is hidden: a fault meanwhile waits.
+        let pages = crate::watch::alias_pages(page / PAGE);
+        {
+            let mut l = lazy();
+            for &p in &pages {
+                if l.at.contains_key(&p) {
+                    // Another mapping of it is pending already (as another
+                    // copy's): this one goes back now.
+                    add(K::Shared, 1);
+                    return false;
+                }
+            }
+            for &p in &pages {
+                l.at.insert(p, page);
+            }
+            l.groups.insert(
+                page,
+                Group {
+                    copies: vec![(copy.clone(), page)],
+                    pages: pages.clone(),
+                    busy: Some(me),
+                    frame: frame_now(),
+                },
+            );
+            PENDING.store(l.groups.len(), Relaxed);
+        }
+        let hidden = t.hide(page / PAGE, &pages);
+        let mut l = lazy();
+        if hidden {
+            t.unarm(page / PAGE);
+            if let Some(g) = l.groups.get_mut(&page) {
+                g.busy = None;
+            }
+            add(K::Deferred, 1);
+        } else {
+            l.groups.remove(&page);
+            for p in &pages {
+                l.at.remove(p);
+            }
+            PENDING.store(l.groups.len(), Relaxed);
+            add(K::Shared, 1);
+        }
+        hidden
+    }
+
+    /// A CPU access faulted at `at`: if a hidden page, it is brought back
+    /// (or was, by another thread) and the access may run again.
+    pub(crate) fn fault(at: usize) -> bool {
+        let c = match lazy_read().at.get(&(at / PAGE)) {
+            Some(&c) => c,
+            None => return false,
+        };
+        if GATED.get() {
+            add(K::FaultSubmit, 1);
+        }
+        flush(c, Path::Fault)
+    }
+
+    /// Brings back the pending pages in title memory `[at, at + len)` and
+    /// at every other address showing them.
+    pub(crate) fn flush_range(at: usize, len: usize, path: Path) {
+        if len == 0 || PENDING.load(Relaxed) == 0 {
+            return;
+        }
+        let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+        let mut groups: Vec<usize> = {
+            let l = lazy_read();
+            let mut hit = l.at.range(first..last).map(|(_, &c)| c).peekable();
+            if hit.peek().is_none() {
+                return;
+            }
+            hit.collect()
+        };
+        groups.sort_unstable();
+        groups.dedup();
+        for c in groups {
+            flush(c, path);
+        }
+    }
+
+    /// Brings back the pending pages `copy` holds (its buffer is released).
+    pub(crate) fn flush_copy(copy: &Arc<Shadow>) {
+        if PENDING.load(Relaxed) == 0 {
+            return;
+        }
+        let groups: Vec<usize> = lazy_read()
+            .groups
+            .iter()
+            .filter(|(_, g)| g.copies.iter().any(|(x, _)| Arc::ptr_eq(x, copy)))
+            .map(|(&c, _)| c)
+            .collect();
+        for c in groups {
+            flush(c, Path::Unregister);
+        }
+    }
+
+    /// Brings pending page `c` back: shown read-only again, and its copies'
+    /// copy-backs run as after a submission. Waits while another thread
+    /// does it. False if this thread is doing it already.
+    fn flush(c: usize, path: Path) -> bool {
+        let me = me();
+        let (copies, pages, frame) = loop {
+            let mut l = lazy();
+            let Some(g) = l.groups.get_mut(&c) else {
+                return true;
+            };
+            match g.busy {
+                None => {
+                    g.busy = Some(me);
+                    break (g.copies.clone(), g.pages.clone(), g.frame);
+                }
+                Some(o) if o == me => return false,
+                Some(_) => {}
+            }
+            drop(l);
+            std::thread::yield_now();
+        };
+        let started = std::time::Instant::now();
+        {
+            let _gate = Gate::take();
+            crate::watch::unhide(&pages);
+            for (copy, page) in &copies {
+                let armed = copy.tracked.as_ref().is_some_and(|t| t.armed(page / PAGE));
+                copy.copy_back_marked(*page);
+                // Armed for a submission prepared meanwhile: still.
+                if armed && let Some(t) = &copy.tracked {
+                    t.arm(*page, page + PAGE);
+                }
+            }
+        }
+        {
+            let mut l = lazy();
+            l.groups.remove(&c);
+            for p in &pages {
+                l.at.remove(p);
+            }
+            PENDING.store(l.groups.len(), Relaxed);
+        }
+        add(K::FlushUs, started.elapsed().as_micros() as u64);
+        FLUSHED[path as usize].fetch_add(1, Relaxed);
+        let age = frame_now().saturating_sub(frame);
+        add(
+            match age {
+                0 => K::Age0,
+                1 => K::Age1,
+                _ => K::AgeMore,
+            },
+            1,
+        );
+        add(K::AgeFrames, age);
+        true
+    }
+
+    /// At each presented frame (diagnostics): pages pending then.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn frame_done() {
+        add(K::AtPresent, PENDING.load(Relaxed) as u64);
+        add(K::Presents, 1);
+    }
+
+    /// Logs the counters per frame over `frames` frames (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn log(frames: f64) {
+        if !on() {
+            return;
+        }
+        let c: Vec<f64> = COUNT.iter().map(|a| a.swap(0, Relaxed) as f64).collect();
+        let f: Vec<f64> = FLUSHED.iter().map(|a| a.swap(0, Relaxed) as f64).collect();
+        let flushed: f64 = f.iter().sum();
+        let paths: Vec<String> = PATHS
+            .iter()
+            .zip(&f)
+            .filter(|(_, n)| **n > 0.0)
+            .map(|(name, n)| format!("{name} {:.1}", n / frames))
+            .collect();
+        let per = |k: K| c[k as usize] / frames;
+        tracing::info!(
+            "lazy copy-back per frame: {:.0} pages deferred, {:.0} marked again while pending; {:.1} brought back ({}) in {:.2} ms (waiting for the GPU {:.2} ms; {:.1} faults on the submitting thread); not deferred: {:.0} shared or not hidden, {:.0} title-written or partial; age when brought back: {:.1} same frame, {:.1} next, {:.1} later (mean {:.1} frames); {:.0} pages pending at present",
+            per(K::Deferred),
+            per(K::Remarked),
+            flushed / frames,
+            paths.join(", "),
+            per(K::FlushUs) / 1e3,
+            per(K::GateUs) / 1e3,
+            per(K::FaultSubmit),
+            per(K::Shared),
+            per(K::Other),
+            per(K::Age0),
+            per(K::Age1),
+            per(K::AgeMore),
+            c[K::AgeFrames as usize] / flushed.max(1.0),
+            c[K::AtPresent as usize] / c[K::Presents as usize].max(1.0),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2474,6 +2928,68 @@ void main(uint3 id : SV_DispatchThreadID) {
         let t = copy.tracked.as_ref().expect("tracked memory");
         assert!(!t.changed(p / PAGE), "still taken");
         assert_eq!(copy.copy_back(p, PAGE), 0, "nothing kept to compare");
+        unregister(p, p as u64);
+    }
+
+    /// Lazy copy-back (`VICTORY_LAZY_COPY_BACK=1`, in a child process: the
+    /// switch is read once): marked pages stay pending, hidden, and title
+    /// memory keeps its bytes; a page marked again stays pending and brings
+    /// both submissions' bytes; the CPU's first read faults one page back,
+    /// our own read of title memory brings the other.
+    #[test]
+    fn lazy_copy_back_waits_for_the_first_cpu_access() {
+        const CHILD: &str = "VICTORY_TEST_LAZY_CHILD";
+        let name = "shadow::tests::lazy_copy_back_waits_for_the_first_cpu_access";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([name, "--exact", "--test-threads=1", "--nocapture"])
+                .env(CHILD, "1")
+                .env("VICTORY_LAZY_COPY_BACK", "1")
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success() && text.contains("1 passed"), "{name} with the switch on:\n{text}");
+            return;
+        }
+        assert!(lazy::on());
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap()) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        let mark = |n: usize| {
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *(b.data as *mut u32).add(n / 32) |= 1 << (n % 32) };
+        };
+        let submission = |bytes: &[(usize, u8)]| {
+            copy.update(p, len);
+            copy.writing(p, len, true);
+            for &(at, v) in bytes {
+                copy.write_host((p + at) as u64, &[v]);
+                mark(base + at / PAGE);
+            }
+            copy_back_marks(&[]);
+            assert_eq!(copy.copy_back(p, len), 0);
+        };
+        submission(&[(10, 0xaa), (PAGE + 20, 0xbb)]);
+        let mut probe = [0u8; 1];
+        assert!(
+            !crate::host::read_unflushed((p + 10) as *const u8, &mut probe),
+            "pending pages are hidden"
+        );
+        // Marked again while pending: the second submission's byte too.
+        submission(&[(11, 0xcc)]);
+        // SAFETY: bytes of our pool (the fault brings the page back).
+        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        assert_eq!((read(10), read(11)), (0xaa, 0xcc), "the first access brings both bytes");
+        assert!(crate::host::read_into((p + PAGE + 20) as *const u8, &mut probe));
+        assert_eq!(probe[0], 0xbb, "our own read brings the other page");
+        let t = copy.tracked.as_ref().expect("tracked memory");
+        assert!(!t.changed(p / PAGE) && !t.changed(p / PAGE + 1), "both taken again");
+        assert_eq!(lazy::PENDING.load(std::sync::atomic::Ordering::Relaxed), 0);
         unregister(p, p as u64);
     }
 
