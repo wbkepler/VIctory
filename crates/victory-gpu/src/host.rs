@@ -858,7 +858,14 @@ impl Host {
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
+        #[cfg(feature = "diagnostics")]
+        let synced = std::time::Instant::now();
         crate::descriptor::sync_heaps();
+        #[cfg(feature = "diagnostics")]
+        crate::descriptor::host::stats::SYNC_US.fetch_add(
+            synced.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
@@ -2916,6 +2923,7 @@ impl Meter {
                 crate::shadow::lazy::log(copy_frames);
                 crate::bindless::log(copy_frames);
                 crate::shadow::log_views(copy_frames);
+                crate::descriptor::log_heaps(copy_frames);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",

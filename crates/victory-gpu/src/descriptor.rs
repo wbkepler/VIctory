@@ -167,6 +167,8 @@ fn mirror(handle: u64) {
 /// heap at indices in their data, where a slot never mirrored reads nothing.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
+    #[cfg(feature = "diagnostics")]
+    host::stats::tick();
     sync_heaps_with(
         |heap| heap.host.get()?.as_ref().map(std::sync::Arc::clone),
         |host, first, last, step, bytes| host.mirror_bytes(first, last, step, bytes),
@@ -300,6 +302,20 @@ pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) ->
     // for the lock we hold).
     let host = unsafe { &*(heap as *const Heap) }.host.get()?.as_deref()?;
     Some(f(host))
+}
+
+/// Diagnostics: how the host view heaps' title blocks and dynamic slots
+/// are used, over the last `frames` frames.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn log_heaps(frames: f64) {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped, which
+        // waits for the lock we hold).
+        if let Some(Some(host)) = unsafe { &*(at as *const Heap) }.host.get() {
+            host.log_stats(frames);
+        }
+    }
 }
 
 #[cfg(windows)]
