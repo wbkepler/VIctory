@@ -634,10 +634,11 @@ enum Step {
     Fill(usize, usize, usize),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
-    /// intervenes.
+    /// writes title memory there.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
-    /// Work that may write title memory.
-    Run(Box<dyn Fn() + Send>),
+    /// Work that may write title memory in a range (address, bytes) and
+    /// nowhere else.
+    Run(Box<dyn Fn() + Send>, usize, usize),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy;
@@ -949,7 +950,7 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
-        batch.flush();
+        batch.finish();
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -1898,10 +1899,12 @@ impl HostList {
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
-    /// `work` may write title memory (refreshes after it copy again).
-    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+    /// `work` may write title memory `[at, at + len)` (refreshes after it
+    /// copy what changed there again).
+    pub(crate) fn defer(&self, at: usize, len: usize, work: impl Fn() + Send + 'static) {
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work), at, len));
+        deferred.refreshed.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -1929,7 +1932,7 @@ impl HostList {
                 match step {
                     Step::Refresh(..) => C::StepRefreshUs,
                     Step::Copy(..) | Step::Fill(..) => C::StepCopyUs,
-                    Step::Run(_) | Step::Host(_) => C::StepWorkUs,
+                    Step::Run(..) | Step::Host(_) => C::StepWorkUs,
                     Step::GpuWrite(..) => C::StepGpuWriteUs,
                     Step::Texture(_) => C::StepTextureUs,
                     Step::Heap(_) => C::StepHeapUs,
@@ -1943,7 +1946,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    batch.title_wrote(dst, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -1965,9 +1968,9 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
-                    if matches!(step, Step::Run(_)) {
-                        batch.title_written();
+                Step::Run(work, ..) | Step::Host(work) => {
+                    if let &Step::Run(_, at, len) = step {
+                        batch.title_wrote(at, len);
                     }
                     work();
                     #[cfg(feature = "diagnostics")]
@@ -1984,6 +1987,9 @@ impl HostList {
                         batch.flush();
                     }
                     shadow.writing(*address, *len, *marked);
+                    if *marked {
+                        batch.armed(shadow, *address, *len);
+                    }
                     continue;
                 }
                 Step::Texture(staging) => {
@@ -2019,10 +2025,13 @@ impl HostList {
 /// once, it is checked again only after a step that writes title memory.
 ///
 /// A copy's ranges brought up to date are not copied again in the submission
-/// until a step writes title memory: every list of a world submission using
-/// title memory asks for every copy whole. What the title's threads write
-/// meanwhile is for later submissions (on the console it would race the
-/// GPU).
+/// until a step writes title memory there (or at another mapping of its
+/// pages): every list of a world submission using title memory asks for
+/// every copy whole. What the title's threads write meanwhile is for later
+/// submissions (on the console it would race the GPU), except in ranges
+/// shaders write through marks: those are brought up to date once more
+/// before the lists run ([`Batch::finish`]). (Each of the world's ~30 small
+/// title copies a frame used to make every copy due again.)
 /// A copy with ranges of it (start, end).
 type Ranges = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
 
@@ -2031,9 +2040,14 @@ struct Batch {
     refreshes: Vec<Ranges>,
     /// Where each copy's refresh entry is in `refreshes`, by copy.
     pending: std::collections::HashMap<usize, usize>,
-    /// Disjoint ranges of each copy brought up to date since the last title
-    /// write, by copy (held, so that its address names no other).
+    /// Disjoint ranges of each copy brought up to date since a step last
+    /// wrote title memory there, by copy (held, so that its address names
+    /// no other).
     current: std::collections::HashMap<usize, Ranges>,
+    /// Disjoint ranges of each copy that shaders write through marks in the
+    /// submission (armed: a title write there keeps the page's bytes), by
+    /// copy.
+    armed: std::collections::HashMap<usize, Ranges>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
@@ -2070,6 +2084,28 @@ fn insert_range(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize, page_c
     }
 }
 
+/// Takes `[from, to)` out of disjoint sorted ranges.
+fn cut_range(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    if from >= to {
+        return;
+    }
+    let first = ranges.partition_point(|&(_, end)| end <= from);
+    let last = first
+        + ranges[first..]
+            .iter()
+            .take_while(|&&(start, _)| start < to)
+            .count();
+    if first == last {
+        return;
+    }
+    let (head, tail) = (ranges[first].0, ranges[last - 1].1);
+    let kept: Vec<(usize, usize)> = [(head, from), (to, tail)]
+        .into_iter()
+        .filter(|&(a, b)| a < b)
+        .collect();
+    ranges.splice(first..last, kept);
+}
+
 fn range_covered(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     let i = ranges.partition_point(|&(_, end)| end < to);
     ranges.get(i).is_some_and(|&(a, b)| a <= from && to <= b)
@@ -2104,12 +2140,80 @@ impl Batch {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
-    /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
-    fn title_written(&mut self) {
+    /// Before a step that writes title memory `[at, at + len)`: pending
+    /// refreshes are done first, and textures are checked again after it.
+    /// The ranges of copies the write reaches, there or at another mapping
+    /// of its pages, are brought up to date again when asked; the rest
+    /// stays current (a copy not tracked is due again whole).
+    ///
+    /// Every copy due again, the world's small title copies made each list
+    /// after them check every copy again (most of the ~90,000 checks a
+    /// frame, nearly all finding nothing changed).
+    fn title_wrote(&mut self, at: usize, len: usize) {
+        use crate::watch::PAGE;
         self.flush();
         self.textures.clear();
-        self.current.clear();
+        if self.current.is_empty() {
+            return;
+        }
+        // Whole pages: a tracked copy takes and copies by page.
+        let end = at.saturating_add(len);
+        let mut written = vec![(at / PAGE * PAGE, end.div_ceil(PAGE).saturating_mul(PAGE))];
+        written.extend(
+            crate::watch::aliased_pages(at, len)
+                .into_iter()
+                .map(|page| (page * PAGE, (page + 1) * PAGE)),
+        );
+        self.current.retain(|_, (shadow, ranges)| {
+            if !shadow.is_tracked() {
+                return false;
+            }
+            for &(from, to) in &written {
+                cut_range(ranges, from, to);
+            }
+            !ranges.is_empty()
+        });
+    }
+
+    /// At submission, after the range's refresh: shaders write
+    /// `[address, address + len)` of `shadow` through marks.
+    fn armed(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
+        if len == 0 {
+            return;
+        }
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let (_, ranges) = self
+            .armed
+            .entry(key)
+            .or_insert_with(|| (shadow.clone(), Vec::new()));
+        insert_range(ranges, address, address + len, false);
+    }
+
+    /// Before the lists run: the pending refreshes, then once more what the
+    /// title wrote since its copy took it in ranges shaders write through
+    /// marks. Such a page changed with no bytes saved (written before it
+    /// was armed, after a list earlier in the submission took it) keeps the
+    /// title's bytes at copy-back and loses the shaders': taken now, it is
+    /// armed while taken. (With every copy due again after each title copy,
+    /// such pages were rare, ~1 a frame; with that gone and no retake,
+    /// ~20 a frame lost the shaders' bytes, and the title crashed.)
+    fn finish(&mut self) -> usize {
+        let mut total = self.flush();
+        for (_, (shadow, ranges)) in self.armed.drain() {
+            for (from, to) in ranges {
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                total += copied;
+            }
+        }
+        total
     }
 
     /// Does the refreshes; returns the bytes copied.
@@ -3764,7 +3868,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(!batch.texture_due(&a));
         // A copy into title memory or work that may write it may have
         // changed the texture's memory.
-        batch.title_written();
+        batch.title_wrote(0x1000, 16);
         assert!(batch.texture_due(&a));
         assert!(!batch.texture_due(&a));
         // A fresh submission starts over.
@@ -3800,12 +3904,79 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         unsafe { (p as *mut u8).write_volatile(1) };
         batch.add(&copy, p, len);
         assert_eq!(batch.flush(), 0, "nothing again in the submission");
-        batch.title_written();
+        batch.title_wrote(p, 1);
         batch.add(&copy, p, len);
-        assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
+        assert_eq!(
+            batch.flush(),
+            PAGE,
+            "after a title write there, what changed"
+        );
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
+    }
+
+    /// A step writing title memory makes due again only the copies it
+    /// reaches, where it writes or through another mapping of its pages;
+    /// what the title's threads wrote elsewhere waits, except where shaders
+    /// write through marks: that is taken once more before the lists run.
+    #[test]
+    fn a_title_write_refreshes_only_the_copies_it_reaches() {
+        use crate::watch::PAGE;
+        let len = 2 * PAGE;
+        let pools = [0; 3].map(|_| crate::watch::tests::pool(2));
+        let done = |pools: &[usize]| {
+            for &m in pools {
+                crate::shadow::unregister(m, m as u64);
+                crate::watch::tests::free(m);
+            }
+        };
+        for m in pools {
+            crate::shadow::register(m, m as u64, len as u64);
+        }
+        let copies: Vec<_> = pools
+            .iter()
+            .filter_map(|&m| crate::shadow::find(m as u64, len as u64))
+            .collect();
+        let [p, q, r] = pools;
+        let [a, b, c] = &copies[..] else {
+            drop(copies);
+            done(&pools);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        for (copy, m) in [(a, p), (b, q), (c, r)] {
+            batch.add(copy, m, len);
+        }
+        assert_eq!(batch.flush(), 3 * len, "all of them at first");
+        // `r`'s second page shows `p`'s first, as the runtime said.
+        crate::watch::title_memory_aliased(r + PAGE, &[p]);
+        // The title's threads write each copy's second page ...
+        for m in pools {
+            // SAFETY: our pools, guarded since the copies took them.
+            unsafe { ((m + PAGE + 8) as *mut u8).write_volatile(3) };
+        }
+        // ... and a step writes `p`'s first.
+        batch.title_wrote(p, 16);
+        // SAFETY: as above.
+        unsafe { ((p + 8) as *mut u8).write_volatile(5) };
+        for (copy, m) in [(a, p), (b, q), (c, r)] {
+            batch.add(copy, m, len);
+        }
+        // `p` both pages, `r` its second, `q` nothing yet.
+        assert_eq!(batch.flush(), 3 * PAGE);
+        assert_eq!(
+            b.read_host((q + PAGE + 8) as u64, 1)[0],
+            0,
+            "q kept its range"
+        );
+        // Shaders write `q` through marks: its page is taken before they run.
+        batch.armed(b, q, len);
+        assert_eq!(batch.finish(), PAGE, "q's page before the lists run");
+        assert_eq!(b.read_host((q + PAGE + 8) as u64, 1)[0], 3);
+        crate::watch::title_memory_remapped(r + PAGE, PAGE);
+        drop(copies);
+        done(&pools);
     }
 
     /// The hashing a submission does for textures in physical-page memory,
