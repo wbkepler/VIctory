@@ -2279,7 +2279,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let whole = read(src, dst, len) || reread_hidden(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -2316,7 +2316,18 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     // GPU bytes still only in a copy (lazy copy-back) come first.
     crate::shadow::lazy::flush_range(src as usize, dst.len(), crate::shadow::lazy::Path::HostRead);
-    read(src, dst.as_mut_ptr(), dst.len())
+    read(src, dst.as_mut_ptr(), dst.len()) || reread_hidden(src, dst.as_mut_ptr(), dst.len())
+}
+
+/// After a read of title memory failed: if a page there was hidden since
+/// the read's lazy copy-back check (by a copy-back on another thread, of a
+/// page another tracker holds too), it comes back and the read runs again.
+fn reread_hidden(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    if !crate::shadow::lazy::any() {
+        return false;
+    }
+    crate::shadow::lazy::flush_range(src as usize, len, crate::shadow::lazy::Path::HostRead);
+    read(src, dst, len)
 }
 
 /// [`read_into`] with no lazy copy-back first (under the guard lock).

@@ -476,7 +476,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         layout,
         mips: u32::from(d.MipLevels),
         memory,
-        tracked: crate::watch::track(memory as usize, layout_size, true),
+        tracked: crate::watch::track_as(memory as usize, layout_size, true, crate::watch::Kind::Texture),
         last: Mutex::default(),
     });
     *held = Some(s.clone());

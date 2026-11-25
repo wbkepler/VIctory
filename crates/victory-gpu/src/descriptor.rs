@@ -797,7 +797,7 @@ pub(crate) extern "system" fn create_heap(
         pending: Default::default(),
         #[cfg(windows)]
         written: (placed && visible)
-            .then(|| crate::watch::track(start as usize, size as usize, true))
+            .then(|| crate::watch::track_as(start as usize, size as usize, true, crate::watch::Kind::Heap))
             .flatten(),
         #[cfg(windows)]
         alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),

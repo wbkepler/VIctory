@@ -691,6 +691,16 @@ impl Shadow {
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
     pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
+        self.copy_back_marked_from(page, None)
+    }
+
+    /// [`Shadow::copy_back_marked`], with `base` (the whole page) as the
+    /// copy's bytes before the submission if given: a lazy copy-back of a
+    /// page several copies hold GPU bytes of, where title memory holds the
+    /// earlier copies' bytes when a later one goes back (as after a
+    /// submission, where the first copy-back's write saved the page for the
+    /// others).
+    fn copy_back_marked_from(&self, page: usize, base: Option<&[u8]>) -> usize {
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -700,7 +710,10 @@ impl Shadow {
             return 0;
         }
         self.freshen(from - start, to - start);
-        let saved = t.saved(page / PAGE);
+        let saved = match base {
+            Some(b) => Some(Box::from(b)),
+            None => t.saved(page / PAGE),
+        };
         if saved.is_none() && t.changed(page / PAGE) {
             t.unarm(page / PAGE);
             #[cfg(feature = "diagnostics")]
@@ -1565,9 +1578,17 @@ pub(crate) fn near(va: u64) -> String {
 /// While a page is pending, title memory there is the copy as it was before
 /// the first submission that wrote it (the title cannot write it), so the
 /// copy-back's comparison finds every byte the GPU wrote since, however
-/// many submissions marked it again. Only pages one tracker (the copy's)
-/// holds are deferred, so no other copy or texture reads title memory
-/// there; a tracker made later brings them back first.
+/// many submissions marked it again. Other copies and textures holding the
+/// page ([`crate::watch::Other`]) bring it back before they take title
+/// memory there (the copy-back marks them changed where the GPU's bytes
+/// differ, as right after the submission); a tracker made later brings it
+/// back first. Pages a descriptor heap holds go back at once (its sync takes
+/// pages under the heaps' lock). Another copy marking a pending page joins
+/// it if its copy there is title memory's (not changed since it took it),
+/// else the page goes back first; with several copies, each one's bytes
+/// are told from the page as it was hidden. A page the copy holds in part
+/// is hidden whole (the title's bytes beside the copy wait with it) and only
+/// the copy's part goes back.
 ///
 /// shortcut: a page pending when a later submission's writes to it are
 /// withheld (shaders read memory with no copy) puts those back with the
@@ -1610,9 +1631,11 @@ pub(crate) mod lazy {
         Unregister,
         /// A copy-back of declared ranges or computed addresses there.
         CopyBack,
+        /// Another tracker holding the page takes title memory there.
+        Holder,
     }
 
-    const PATHS: [&str; 10] = [
+    const PATHS: [&str; 11] = [
         "CPU faults",
         "kernel writes",
         "remaps",
@@ -1623,6 +1646,7 @@ pub(crate) mod lazy {
         "physical-page writes",
         "released buffers",
         "other copy-backs",
+        "other holders' refreshes",
     ];
 
     /// A pending page: the copies (and their page) holding its GPU bytes,
@@ -1633,6 +1657,8 @@ pub(crate) mod lazy {
         pages: Vec<usize>,
         busy: Option<usize>,
         frame: u64,
+        /// The other trackers holding it, until it is back.
+        _others: Vec<crate::watch::Other>,
     }
 
     #[derive(Default)]
@@ -1657,13 +1683,29 @@ pub(crate) mod lazy {
     /// Pending pages (groups): the hooks cost nothing when there are none.
     pub(super) static PENDING: AtomicUsize = AtomicUsize::new(0);
 
+    /// Whether any page is pending.
+    pub(crate) fn any() -> bool {
+        PENDING.load(Relaxed) != 0
+    }
+
     /// Counters since the last log line (some logged by diagnostics only).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     enum K {
         Deferred,
         Remarked,
-        Shared,
-        Other,
+        Joined,
+        WithCopies,
+        WithTextures,
+        Partial,
+        AliasPending,
+        Aliases,
+        Unguarded,
+        Busy,
+        Heap,
+        Protect,
+        TitleSaved,
+        TitleChanged,
+        StaleJoin,
         FlushUs,
         GateUs,
         FaultSubmit,
@@ -1674,7 +1716,7 @@ pub(crate) mod lazy {
         AtPresent,
         Presents,
     }
-    const COUNTERS: usize = 13;
+    const COUNTERS: usize = 24;
     static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
     static FLUSHED: [AtomicU64; PATHS.len()] = [const { AtomicU64::new(0) }; PATHS.len()];
 
@@ -1754,8 +1796,9 @@ pub(crate) mod lazy {
     /// After a submission (its marked pages pulled into the mirrors): the
     /// marked page at `page` of `copy` waits, hidden, instead of going back.
     /// False where it must go back now: the title wrote it during the
-    /// submission, another tracker or mapping holds it, it is not whole in
-    /// the copy, or it cannot be hidden.
+    /// submission, a descriptor heap holds it, it cannot be hidden, or it
+    /// is pending already for other copies and this one's copy of it is not
+    /// title memory's (then it went back first).
     pub(crate) fn defer(copy: &Arc<Shadow>, page: usize) -> bool {
         let me = me();
         loop {
@@ -1768,7 +1811,20 @@ pub(crate) mod lazy {
                 // Marked again while pending: still pending, title memory
                 // still as before the first of them.
                 if !g.copies.iter().any(|(x, p)| Arc::ptr_eq(x, copy) && *p == page) {
+                    // Another copy (or mapping): its bytes before are title
+                    // memory's only if it took the page since it changed.
+                    let fresh = copy
+                        .tracked
+                        .as_ref()
+                        .is_some_and(|t| !t.changed(page / PAGE) && !t.has_saved(page / PAGE));
+                    if !fresh {
+                        drop(l);
+                        flush(c, Path::CopyBack);
+                        add(K::StaleJoin, 1);
+                        return false;
+                    }
                     g.copies.push((copy.clone(), page));
+                    add(K::Joined, 1);
                 }
                 add(K::Remarked, 1);
                 return true;
@@ -1781,8 +1837,15 @@ pub(crate) mod lazy {
             return false;
         };
         let (start, end) = (copy.start as usize, (copy.start + copy.len) as usize);
-        if page < start || page + PAGE > end || t.has_saved(page / PAGE) || t.changed(page / PAGE) {
-            add(K::Other, 1);
+        if page + PAGE <= start || page >= end {
+            return false;
+        }
+        if t.has_saved(page / PAGE) {
+            add(K::TitleSaved, 1);
+            return false;
+        }
+        if t.changed(page / PAGE) {
+            add(K::TitleChanged, 1);
             return false;
         }
         // Indexed (busy) before it is hidden: a fault meanwhile waits.
@@ -1793,7 +1856,7 @@ pub(crate) mod lazy {
                 if l.at.contains_key(&p) {
                     // Another mapping of it is pending already (as another
                     // copy's): this one goes back now.
-                    add(K::Shared, 1);
+                    add(K::AliasPending, 1);
                     return false;
                 }
             }
@@ -1807,27 +1870,52 @@ pub(crate) mod lazy {
                     pages: pages.clone(),
                     busy: Some(me),
                     frame: frame_now(),
+                    _others: Vec::new(),
                 },
             );
             PENDING.store(l.groups.len(), Relaxed);
         }
         let hidden = t.hide(page / PAGE, &pages);
         let mut l = lazy();
-        if hidden {
-            t.unarm(page / PAGE);
-            if let Some(g) = l.groups.get_mut(&page) {
-                g.busy = None;
+        match hidden {
+            Ok(others) => {
+                t.unarm(page / PAGE);
+                if others.iter().any(|o| o.kind() == crate::watch::Kind::Copy) {
+                    add(K::WithCopies, 1);
+                }
+                if others.iter().any(|o| o.kind() == crate::watch::Kind::Texture) {
+                    add(K::WithTextures, 1);
+                }
+                if page < start || page + PAGE > end {
+                    add(K::Partial, 1);
+                }
+                if let Some(g) = l.groups.get_mut(&page) {
+                    g.busy = None;
+                    g._others = others;
+                }
+                add(K::Deferred, 1);
+                true
             }
-            add(K::Deferred, 1);
-        } else {
-            l.groups.remove(&page);
-            for p in &pages {
-                l.at.remove(p);
+            Err(why) => {
+                l.groups.remove(&page);
+                for p in &pages {
+                    l.at.remove(p);
+                }
+                PENDING.store(l.groups.len(), Relaxed);
+                use crate::watch::Refused;
+                add(
+                    match why {
+                        Refused::Aliases => K::Aliases,
+                        Refused::Unguarded => K::Unguarded,
+                        Refused::Busy => K::Busy,
+                        Refused::Heap => K::Heap,
+                        Refused::Protect => K::Protect,
+                    },
+                    1,
+                );
+                false
             }
-            PENDING.store(l.groups.len(), Relaxed);
-            add(K::Shared, 1);
         }
-        hidden
     }
 
     /// A CPU access faulted at `at`: if a hidden page, it is brought back
@@ -1906,9 +1994,17 @@ pub(crate) mod lazy {
         {
             let _gate = Gate::take();
             crate::watch::unhide(&pages);
+            // Several copies: each one's bytes before are the page as it was
+            // hidden, not as the copies before it in turn leave it.
+            let base = (copies.len() > 1)
+                .then(|| {
+                    let mut base = vec![0u8; PAGE].into_boxed_slice();
+                    crate::host::read_unflushed(c as *const u8, &mut base).then_some(base)
+                })
+                .flatten();
             for (copy, page) in &copies {
                 let armed = copy.tracked.as_ref().is_some_and(|t| t.armed(page / PAGE));
-                copy.copy_back_marked(*page);
+                copy.copy_back_marked_from(*page, base.as_deref());
                 // Armed for a submission prepared meanwhile: still.
                 if armed && let Some(t) = &copy.tracked {
                     t.arm(*page, page + PAGE);
@@ -1962,16 +2058,27 @@ pub(crate) mod lazy {
             .collect();
         let per = |k: K| c[k as usize] / frames;
         tracing::info!(
-            "lazy copy-back per frame: {:.0} pages deferred, {:.0} marked again while pending; {:.1} brought back ({}) in {:.2} ms (waiting for the GPU {:.2} ms; {:.1} faults on the submitting thread); not deferred: {:.0} shared or not hidden, {:.0} title-written or partial; age when brought back: {:.1} same frame, {:.1} next, {:.1} later (mean {:.1} frames); {:.0} pages pending at present",
+            "lazy copy-back per frame: {:.0} pages deferred ({:.0} with other copies holding them, {:.0} with textures, {:.0} held in part), {:.0} marked again while pending ({:.0} by another copy); {:.1} brought back ({}) in {:.2} ms (waiting for the GPU {:.2} ms; {:.1} faults on the submitting thread); not deferred: {:.0} title-written ({:.0} saved), {:.0} heap-held, {:.0} unguarded, {:.0} busy, {:.0} other mapping pending, {:.0} aliases moved, {:.0} not protectable, {:.0} stale copy joining; age when brought back: {:.1} same frame, {:.1} next, {:.1} later (mean {:.1} frames); {:.0} pages pending at present",
             per(K::Deferred),
+            per(K::WithCopies),
+            per(K::WithTextures),
+            per(K::Partial),
             per(K::Remarked),
+            per(K::Joined),
             flushed / frames,
             paths.join(", "),
             per(K::FlushUs) / 1e3,
             per(K::GateUs) / 1e3,
             per(K::FaultSubmit),
-            per(K::Shared),
-            per(K::Other),
+            per(K::TitleChanged) + per(K::TitleSaved),
+            per(K::TitleSaved),
+            per(K::Heap),
+            per(K::Unguarded),
+            per(K::Busy),
+            per(K::AliasPending),
+            per(K::Aliases),
+            per(K::Protect),
+            per(K::StaleJoin),
             per(K::Age0),
             per(K::Age1),
             per(K::AgeMore),
@@ -2990,6 +3097,83 @@ void main(uint3 id : SV_DispatchThreadID) {
         let t = copy.tracked.as_ref().expect("tracked memory");
         assert!(!t.changed(p / PAGE) && !t.changed(p / PAGE + 1), "both taken again");
         assert_eq!(lazy::PENDING.load(std::sync::atomic::Ordering::Relaxed), 0);
+        unregister(p, p as u64);
+    }
+
+    /// Lazy copy-back (as above, in a child process) of a page two copies
+    /// hold, the inner one in part: both copies' bytes wait, hidden, and the
+    /// first access brings both (neither puts its old bytes over the
+    /// other's); a page only the outer copy wrote comes back when the inner
+    /// copy refreshes its part, which then has the outer copy's byte.
+    #[test]
+    fn lazy_copy_back_of_a_page_two_copies_hold() {
+        const CHILD: &str = "VICTORY_TEST_LAZY_CHILD";
+        let name = "shadow::tests::lazy_copy_back_of_a_page_two_copies_hold";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([name, "--exact", "--test-threads=1", "--nocapture"])
+                .env(CHILD, "1")
+                .env("VICTORY_LAZY_COPY_BACK", "1")
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success() && text.contains("1 passed"), "{name} with the switch on:\n{text}");
+            return;
+        }
+        assert!(lazy::on());
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        let (inner_at, inner_len) = (p + 256, 4096);
+        register(p, p as u64, len as u64);
+        register(p + 1, inner_at as u64, inner_len as u64);
+        let (Some(outer), Some(inner), Some(b)) = (
+            find(p as u64, len as u64),
+            find(inner_at as u64, inner_len as u64),
+            bitmap(),
+        ) else {
+            unregister(p, p as u64);
+            unregister(p + 1, inner_at as u64);
+            return; // no host GPU here
+        };
+        assert!(!Arc::ptr_eq(&outer, &inner));
+        let write = |copy: &Shadow, at: usize, v: u8| {
+            copy.write_host((p + at) as u64, &[v]);
+            let n = copy.marks.expect("tracked memory gets mark bits") as usize + (p + at) / PAGE
+                - copy.start as usize / PAGE;
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *(b.data as *mut u32).add(n / 32) |= 1 << (n % 32) };
+        };
+        let pending = || lazy::PENDING.load(std::sync::atomic::Ordering::Relaxed);
+        let mut probe = [0u8; 1];
+        // Both copies write page 0 in one submission.
+        outer.update(p, len);
+        inner.update(inner_at, inner_len);
+        outer.writing(p, len, true);
+        inner.writing(inner_at, inner_len, true);
+        write(&outer, 300, 0xaa);
+        write(&inner, 400, 0xbb);
+        copy_back_marks(&[]);
+        assert_eq!(outer.copy_back(p, len), 0);
+        assert_eq!(inner.copy_back(inner_at, inner_len), 0);
+        assert_eq!(pending(), 1, "one page, both copies");
+        assert!(!crate::host::read_unflushed((p + 300) as *const u8, &mut probe), "hidden");
+        // SAFETY: bytes of our pool (the fault brings the page back).
+        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        assert_eq!((read(300), read(400)), (0xaa, 0xbb), "both copies' bytes");
+        assert_eq!(pending(), 0);
+        // Only the outer copy writes page 0, in the inner copy's part.
+        outer.update(p, len);
+        inner.update(inner_at, inner_len);
+        outer.writing(p, len, true);
+        write(&outer, 500, 0xcc);
+        copy_back_marks(&[]);
+        assert_eq!(outer.copy_back(p, len), 0);
+        assert_eq!(pending(), 1, "deferred though the inner copy holds it");
+        inner.update(inner_at, inner_len);
+        assert_eq!(pending(), 0, "the inner copy's refresh brought it back");
+        assert_eq!(inner.read_host((p + 500) as u64, 1)[0] & 0xff, 0xcc, "and has the outer copy's byte");
+        assert_eq!(read(500), 0xcc);
+        unregister(p + 1, inner_at as u64);
         unregister(p, p as u64);
     }
 

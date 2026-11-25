@@ -54,6 +54,60 @@ struct Changed {
     /// True while `saved.bytes` is non-empty, so taking pages skips the
     /// `saved` mutex when nothing is saved.
     has_saved: AtomicBool,
+    /// What holds the memory: which pages it may share with a lazy
+    /// copy-back.
+    kind: Kind,
+    /// Pending pages (lazy copy-back) another tracker holds the GPU's bytes
+    /// of that this one holds too ([`Other`]): taking pages brings those in
+    /// the range back first.
+    others: AtomicUsize,
+}
+
+/// What a tracker copies title memory for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Kind {
+    /// A host copy of a buffer (`crate::shadow`).
+    Copy,
+    /// A texture's staging (`crate::texture`).
+    Texture,
+    /// A shader-visible descriptor heap (`crate::descriptor`): its sync
+    /// takes pages under the heaps' lock, where no copy-back may wait for
+    /// the GPU, so no page it holds is deferred.
+    Heap,
+}
+
+/// Lazy copy-back: another tracker holding a page whose GPU bytes are only
+/// in a copy, for as long as it is pending. While it lives, the tracker's
+/// [`Tracked::take`] brings pending pages in its range back first, which
+/// marks it changed where the GPU's bytes differ (as the copy-back right
+/// after the submission did): its next refresh then copies them.
+pub(crate) struct Other(Arc<Changed>);
+
+impl Other {
+    pub(crate) fn kind(&self) -> Kind {
+        self.0.kind
+    }
+}
+
+impl Drop for Other {
+    fn drop(&mut self) {
+        self.0.others.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Why [`Tracked::hide`] did not hide a page.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Refused {
+    /// Its other mappings changed since the caller asked.
+    Aliases,
+    /// A mapping of it is not guarded (not taken, or cannot be).
+    Unguarded,
+    /// A write the guards do not see is under way there.
+    Busy,
+    /// A descriptor heap holds it.
+    Heap,
+    /// Its protection could not be changed.
+    Protect,
 }
 
 /// Pages (page numbers) whose bytes a tracker keeps when they are first
@@ -67,13 +121,15 @@ struct Saved {
 }
 
 impl Changed {
-    fn new(pages: BTreeSet<usize>) -> Self {
+    fn new(pages: BTreeSet<usize>, kind: Kind) -> Self {
         let count = pages.len();
         Changed {
             pages: Mutex::new(pages),
             dirty: AtomicUsize::new(count),
             saved: Mutex::default(),
             has_saved: AtomicBool::new(false),
+            kind,
+            others: AtomicUsize::new(0),
         }
     }
 
@@ -249,6 +305,11 @@ fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) {
 /// streamed textures and video planes through a pool view and maps the
 /// pages into its tiled heap, where a guard sees none of it).
 pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
+    track_as(start, len, views, Kind::Copy)
+}
+
+/// [`track`] for what `kind` says holds the memory.
+pub(crate) fn track_as(start: usize, len: usize, views: bool, kind: Kind) -> Option<Tracked> {
     if len == 0 || !runtime_memory(start, views) {
         return None;
     }
@@ -258,7 +319,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     crate::shadow::lazy::flush_range(start, len, crate::shadow::lazy::Path::Track);
     let end = start + len;
     let pages = start / PAGE..end.div_ceil(PAGE);
-    let changed = Arc::new(Changed::new(pages.clone().collect()));
+    let changed = Arc::new(Changed::new(pages.clone().collect(), kind));
     let mut g = guards();
     for page in pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -341,7 +402,15 @@ impl Tracked {
     /// only partly in `[from, to)` is copied in part and stays changed.
     pub(crate) fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
         let (from, to) = (from.max(self.start), to.min(self.end));
-        if from >= to || self.changed.dirty.load(Ordering::Acquire) == 0 {
+        if from >= to {
+            return Vec::new();
+        }
+        // Pages another copy holds the GPU's bytes of (lazy copy-back) come
+        // back first: changed here where they differ.
+        if self.changed.others.load(Ordering::Acquire) != 0 {
+            crate::shadow::lazy::flush_range(from, to - from, crate::shadow::lazy::Path::Holder);
+        }
+        if self.changed.dirty.load(Ordering::Acquire) == 0 {
             return Vec::new();
         }
         let pages: Vec<usize> = {
@@ -496,27 +565,42 @@ impl Tracked {
     /// Lazy copy-back: hides page `page` (a page number) and every other
     /// address showing it from the title (no access) while its copy holds
     /// bytes the GPU wrote that title memory does not have yet. Only when
-    /// this tracker alone holds them and all are guarded (taken), with no
-    /// write the guards do not see under way. `pages`: [`alias_pages`] of
-    /// it, as the caller indexed them. True if hidden.
-    pub(crate) fn hide(&self, page: usize, pages: &[usize]) -> bool {
+    /// all are guarded (taken), with no write the guards do not see under
+    /// way, and no descriptor heap holds them. `pages`: [`alias_pages`] of
+    /// it, as the caller indexed them. The other trackers holding them, if
+    /// hidden: until the page is back, their takes bring it back first.
+    pub(crate) fn hide(&self, page: usize, pages: &[usize]) -> Result<Vec<Other>, Refused> {
         use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY, VirtualProtect};
         let g = guards();
         if alias_pages_of(&g, page) != pages {
-            return false;
+            return Err(Refused::Aliases);
         }
+        let mut others: Vec<Arc<Changed>> = Vec::new();
         for &p in pages {
-            if !g.protected.contains(&p) || g.busy.iter().any(|&(a, b)| (a..b).contains(&p)) {
-                return false;
+            if g.busy.iter().any(|&(a, b)| (a..b).contains(&p)) {
+                return Err(Refused::Busy);
             }
-            if g
-                .holders
-                .get(&p)
-                .is_some_and(|h| h.iter().any(|c| !Arc::ptr_eq(c, &self.changed)))
-            {
-                return false;
+            if !g.protected.contains(&p) {
+                return Err(Refused::Unguarded);
+            }
+            for c in g.holders.get(&p).into_iter().flatten() {
+                if Arc::ptr_eq(c, &self.changed) || others.iter().any(|o| Arc::ptr_eq(o, c)) {
+                    continue;
+                }
+                if c.kind == Kind::Heap {
+                    return Err(Refused::Heap);
+                }
+                others.push(c.clone());
             }
         }
+        // Before the page is hidden: a take from now on waits for it.
+        let others: Vec<Other> = others
+            .into_iter()
+            .map(|c| {
+                c.others.fetch_add(1, Ordering::AcqRel);
+                Other(c)
+            })
+            .collect();
         let set = |p: usize, protection| {
             let mut old = 0;
             // SAFETY: title memory we guard; only its protection changes.
@@ -527,11 +611,11 @@ impl Tracked {
                 for &q in &pages[..i] {
                     set(q, PAGE_READONLY);
                 }
-                return false;
+                return Err(Refused::Protect);
             }
         }
         drop(g);
-        true
+        Ok(others)
     }
 
     /// No shader writes the copy any more: nothing is armed or kept.
