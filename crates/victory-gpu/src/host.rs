@@ -2927,6 +2927,7 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             {
                 let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
+                crate::frame::log();
                 crate::copystat::log(copy_frames);
                 crate::shadow::lazy::log(copy_frames);
                 crate::bindless::log(copy_frames);
