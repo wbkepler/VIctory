@@ -564,6 +564,18 @@ pub(crate) fn alias_pages(page: usize) -> Vec<usize> {
     alias_pages_of(&g, page)
 }
 
+/// The pages (page numbers) showing the memory of `[at, at + len)`
+/// elsewhere, as the runtime said when it mapped them: a write there
+/// changes them too.
+pub(crate) fn aliased_pages(at: usize, len: usize) -> Vec<usize> {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let g = guards();
+    g.alias_of
+        .range(first..last)
+        .flat_map(|(_, others)| others.iter().copied())
+        .collect()
+}
+
 fn alias_pages_of(g: &Guards, page: usize) -> Vec<usize> {
     let mut pages = vec![page];
     pages.extend(g.alias_of.get(&page).into_iter().flatten().copied());
