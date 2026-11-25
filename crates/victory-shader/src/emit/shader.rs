@@ -189,6 +189,8 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// LDS accesses lowered with their bound (for tests).
+    pub lds_bounds: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -268,6 +270,7 @@ impl Shader {
             view_index: std::collections::HashMap::new(),
             flags: 0,
             nonuniform_handles: 0,
+            lds_bounds: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,

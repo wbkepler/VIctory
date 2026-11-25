@@ -56,6 +56,9 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    /// LDS accesses lowered with their bound.
+    #[cfg(test)]
+    pub lds_bounds: u32,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1592,6 +1595,8 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
+            lds_bounds: self.s.lds_bounds,
+            #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
@@ -3015,6 +3020,15 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// `guard` narrowed to the lanes where `ok` holds too.
+    fn and_guard(&mut self, guard: Option<V>, ok: V) -> Option<V> {
+        let c = self.cur;
+        Some(match guard {
+            Some(g) => self.s.m.bin(c, Bin::And, g, ok),
+            None => ok,
+        })
+    }
+
     /// Starts code only the lanes where `guard` holds run (a store under a
     /// lane guard): returns where it started and the join block.
     fn begin_guarded(&mut self, guard: Option<V>) -> Option<(usize, usize)> {
@@ -3446,17 +3460,27 @@ impl<'a> Lower<'a> {
                 .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as aligned to what they access
-        // and in bounds (out-of-bounds console accesses read 0 and drop
-        // writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        // shortcut: LDS addresses are taken as aligned to what they access.
+        //
+        // An address past the program's allocation reads 0 and its write is
+        // dropped, as on the console. A program written for one thread group
+        // but dispatched with several computes such addresses from the
+        // global thread id; on the host they would land in whatever
+        // group-shared variable sits next to the LDS array. Returns the
+        // element (element 0 when outside) and whether the address is inside.
+        let dword = |l: &mut Self, bytes: u32| -> (V, V) {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let size = l.s.m.i32(l.s.lds_dwords);
+            let inside = l.s.m.cmp(c, pred::IULT, index, size);
+            l.s.lds_bounds += 1;
+            let zero = l.s.m.i32(0);
+            let index = l.s.m.select(c, inside, index, zero);
             let lds = l.s.lds();
-            l.s.m.element(c, lds, index)
+            (l.s.m.element(c, lds, index), inside)
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -3490,8 +3514,10 @@ impl<'a> Lower<'a> {
                     _ => return Err("an LDS read of bytes or halves"),
                 };
                 let reg = dst_reg.ok_or("an LDS read result")?;
-                let p = dword(self, offset);
+                let (p, inside) = dword(self, offset);
                 let x = self.s.m.load(c, p);
+                let zero = self.s.m.i32(0);
+                let x = self.s.m.select(c, inside, x, zero);
                 let sh = self.lds_shift(a, offset);
                 let x = self.s.m.bin(c, Bin::LShr, x, sh);
                 let left = self.s.m.i32(32 - bits);
@@ -3526,8 +3552,10 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
+                    let (p, inside) = dword(self, off + 4 * k);
                     let x = self.s.m.load(self.cur, p);
+                    let zero = self.s.m.i32(0);
+                    let x = self.s.m.select(self.cur, inside, x, zero);
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -3564,8 +3592,9 @@ impl<'a> Lower<'a> {
                 let part = self.s.m.bin(c, Bin::Shl, mask, sh);
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, part, ones);
-                let p = dword(self, offset);
-                let at = self.begin_guarded(guard);
+                let (p, inside) = dword(self, offset);
+                let g = self.and_guard(guard, inside);
+                let at = self.begin_guarded(g);
                 use super::bitcode::Rmw;
                 self.s.m.atomic(self.cur, Rmw::And, p, keep);
                 self.s.m.atomic(self.cur, Rmw::Or, p, set);
@@ -3579,12 +3608,13 @@ impl<'a> Lower<'a> {
                     stores.push((off + 4 * k as u32, x));
                 }
             }
-            let at = self.begin_guarded(guard);
             for (off, x) in stores {
-                let p = dword(self, off);
+                let (p, inside) = dword(self, off);
+                let g = self.and_guard(guard, inside);
+                let at = self.begin_guarded(g);
                 self.s.m.store(self.cur, p, x);
+                self.end_guarded(at, &[]);
             }
-            self.end_guarded(at, &[]);
             return Ok(());
         }
         // Atomics: the old value returns with `_rtn`.
@@ -3617,8 +3647,24 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
-        let at = self.begin_guarded(guard);
+        let (p, inside) = dword(self, offset);
+        // An active lane whose address is outside gets 0 back, not its old
+        // register value (which is what an inactive lane keeps).
+        let outside = {
+            let c = self.cur;
+            let zero = self.s.m.i32(0);
+            match guard {
+                Some(g) => {
+                    let t = self.s.m.bool(true);
+                    let out = self.s.m.bin(c, Bin::Xor, inside, t);
+                    let active_out = self.s.m.bin(c, Bin::And, g, out);
+                    self.s.m.select(c, active_out, zero, outside)
+                }
+                None => zero,
+            }
+        };
+        let g = self.and_guard(guard, inside);
+        let at = self.begin_guarded(g);
         let r = match rmw {
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
@@ -10965,6 +11011,24 @@ mod tests {
             }]
         };
         lower_with(&words, layout(), used()).unwrap();
+    }
+
+    #[test]
+    fn lds_accesses_are_bounded_by_the_allocation() {
+        // A write, a read and an atomic with a returned value at an address
+        // taken from v0: each compares its dword index with the allocation
+        // (unsigned), so an address outside reads 0 and stores nothing.
+        let words = [
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0xD8D8_0000,
+            0x0200_0000, // ds_read_b32 v2, v0
+            0xD880_0000,
+            0x0300_0100, // ds_add_rtn_u32 v3, v0, v1
+            S_ENDPGM,
+        ];
+        let l = lower_with(&words, vec![], vec![]).unwrap();
+        assert_eq!(l.lds_bounds, 3, "one bound per LDS access");
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
