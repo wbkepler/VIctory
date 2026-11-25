@@ -3324,6 +3324,9 @@ fn title_window() -> Option<HWND> {
         }
         true.into()
     }
+    // `EnumWindows` sees only the calling thread's desktop: the one the
+    // title's windows are on.
+    crate::desktop::attach();
     let mut found: Option<HWND> = None;
     // SAFETY: the callback only writes `found`, which outlives the call.
     let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut found as isize)) };
