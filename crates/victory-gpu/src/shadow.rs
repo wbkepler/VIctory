@@ -434,6 +434,11 @@ impl Shadow {
         self.marks.is_some()
     }
 
+    /// Whether this copy tracks dirty 64 KiB pages via [`crate::watch`].
+    pub(crate) fn is_tracked(&self) -> bool {
+        self.tracked.is_some()
+    }
+
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
     fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);

@@ -1975,46 +1975,93 @@ impl HostList {
     }
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// A submission's refreshes not done yet, coalesced per buffer copy into
+/// disjoint ranges (merging only overlapping/touching ranges, or ranges within
+/// the same 64 KiB tracked page, so two small draws at opposite ends of a big
+/// buffer never pull in the gap between them): done before a step that writes
+/// title memory or gives a range to shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
 /// physical-page memory is hashed whole each time it is checked. Checked
 /// once, it is checked again only after a step that writes title memory.
 ///
-/// A copy's range brought up to date is not copied again in the submission
+/// A copy's ranges brought up to date are not copied again in the submission
 /// until a step writes title memory: every list of a world submission using
 /// title memory asks for every copy whole. What the title's threads write
 /// meanwhile is for later submissions (on the console it would race the
 /// GPU).
+/// A copy with ranges of it (start, end).
+type Ranges = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-    /// Where each copy's refresh is in `refreshes`, by copy.
+    refreshes: Vec<Ranges>,
+    /// Where each copy's refresh entry is in `refreshes`, by copy.
     pending: std::collections::HashMap<usize, usize>,
-    /// The range of each copy brought up to date since the last title
+    /// Disjoint ranges of each copy brought up to date since the last title
     /// write, by copy (held, so that its address names no other).
-    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    current: std::collections::HashMap<usize, Ranges>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
+fn ranges_touch(a_end: usize, b_start: usize, page_coalesce: bool) -> bool {
+    if b_start <= a_end {
+        return true;
+    }
+    if page_coalesce && a_end > 0 {
+        let page = crate::watch::PAGE;
+        return b_start / page <= (a_end - 1) / page;
+    }
+    false
+}
+
+fn insert_range(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize, page_coalesce: bool) {
+    let first = ranges.partition_point(|&(_, end)| !ranges_touch(end, from, page_coalesce));
+    let last = first
+        + ranges[first..]
+            .iter()
+            .take_while(|&&(start, _)| ranges_touch(to, start, page_coalesce))
+            .count();
+    let merged = if first < last {
+        (ranges[first].0.min(from), ranges[last - 1].1.max(to))
+    } else {
+        (from, to)
+    };
+    if first == last {
+        ranges.insert(first, merged);
+    } else if first + 1 == last {
+        ranges[first] = merged;
+    } else {
+        ranges.splice(first..last, [merged]);
+    }
+}
+
+fn range_covered(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
+    let i = ranges.partition_point(|&(_, end)| end < to);
+    ranges.get(i).is_some_and(|&(a, b)| a <= from && to <= b)
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
-        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
+        if len == 0 {
             return;
         }
+        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
+        if self
+            .current
+            .get(&key)
+            .is_some_and(|(_, ranges)| range_covered(ranges, address, end))
+        {
+            return;
+        }
+        let page_coalesce = shadow.is_tracked();
         match self.pending.get(&key) {
-            Some(&i) => {
-                let (_, from, to) = &mut self.refreshes[i];
-                (*from, *to) = ((*from).min(address), (*to).max(end));
-            }
+            Some(&i) => insert_range(&mut self.refreshes[i].1, address, end, page_coalesce),
             None => {
                 self.pending.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), vec![(address, end)]));
             }
         }
     }
@@ -2039,23 +2086,22 @@ impl Batch {
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
         let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-            total += copied;
-            // Kept: the union with what was current if they touch, else
-            // the larger.
+        for (shadow, ranges) in self.refreshes.drain(..) {
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
-            if from <= *b && *a <= to {
-                (*a, *b) = ((*a).min(from), (*b).max(to));
-            } else if to - from > *b - *a {
-                (*a, *b) = (from, to);
+            let (_, cur) = self
+                .current
+                .entry(key)
+                .or_insert_with(|| (shadow.clone(), Vec::new()));
+            for (from, to) in ranges {
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                let us = started.elapsed().as_micros() as u64;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, us, 0);
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                total += copied;
+                insert_range(cur, from, to, false);
             }
         }
         total
@@ -2131,10 +2177,97 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
-/// Copies `len` bytes from `src` to `dst` in the kernel: false if a source
-/// page is not readable or a destination page not writable (the bytes
-/// before that page may have been copied).
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    ".globl victory_copy_fast",
+    ".globl victory_copy_start",
+    ".globl victory_copy_end",
+    ".globl victory_copy_fault",
+    // A leaf with no stack use, so that it needs no unwind information (a
+    // stack walker takes the return address at `rsp`): the callee-saved rdi
+    // and rsi wait in the volatile r10 and r11.
+    "victory_copy_fast:",
+    "mov r10, rdi",
+    "mov r11, rsi",
+    "mov rdi, rcx",
+    "mov rsi, rdx",
+    "mov rcx, r8",
+    "victory_copy_start:",
+    "rep movsb",
+    "victory_copy_end:",
+    "mov rdi, r10",
+    "mov rsi, r11",
+    "mov eax, 1",
+    "ret",
+    "victory_copy_fault:",
+    "mov rdi, r10",
+    "mov rsi, r11",
+    "xor eax, eax",
+    "ret",
+);
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    fn victory_copy_fast(dst: *mut u8, src: *const u8, len: usize) -> u8;
+    static victory_copy_start: u8;
+    static victory_copy_end: u8;
+    static victory_copy_fault: u8;
+}
+
+/// If a fault occurred inside `victory_copy_fast`, redirects `Rip` to its
+/// fault return path so [`read`] returns `false` without entering the kernel
+/// on the common mapped path. Whatever the fault is (an access violation, an
+/// in-page error, a guard page): the caller has the copy fail as the kernel's
+/// would.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn recover_copy(
+    ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+) -> bool {
+    let rip = ctx.Rip as usize;
+    let start = (&raw const victory_copy_start) as usize;
+    let end = (&raw const victory_copy_end) as usize;
+    if rip >= start && rip < end {
+        ctx.Rip = (&raw const victory_copy_fault) as u64;
+        return true;
+    }
+    false
+}
+
+/// Copies `len` bytes from `src` to `dst`: fast user-space `rep movsb`
+/// guarded by our VEH handler (no kernel transition), staging through a
+/// temporary buffer if `src` and `dst` overlap so `memmove` semantics hold,
+/// and falling back to `ReadProcessMemory` on non-x86_64 targets.
+/// Returns `false` if any source page is unreadable or destination page is
+/// unwritable (the bytes before that page may have been copied).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (s, d) = (src as usize, dst as usize);
+        let disjoint = s.checked_add(len).is_some_and(|se| se <= d)
+            || d.checked_add(len).is_some_and(|de| de <= s);
+        crate::watch::ensure_installed();
+        if disjoint {
+            // SAFETY: `victory_copy_fast` restores `rdi`/`rsi` and a fault
+            // at `[victory_copy_start, victory_copy_end)` is redirected by
+            // `recover_copy` to return 0.
+            return unsafe { victory_copy_fast(dst, src, len) != 0 };
+        }
+        // Reserved first so that an absurd length falls back to the kernel's
+        // copy where `vec![0; len]` would abort.
+        #[allow(clippy::slow_vector_initialization)]
+        let mut tmp = Vec::new();
+        if tmp.try_reserve_exact(len).is_ok() {
+            tmp.resize(len, 0);
+            // SAFETY: `tmp` is disjoint from both `src` and `dst`.
+            return unsafe {
+                victory_copy_fast(tmp.as_mut_ptr(), src, len) != 0
+                    && victory_copy_fast(dst, tmp.as_ptr(), len) != 0
+            };
+        }
+    }
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
@@ -2270,6 +2403,170 @@ mod title_copies {
         write_mapped(unsafe { to.add(2 * BLOCK) }, from.as_ptr(), BLOCK);
         assert!(block(to, 2).iter().all(|&b| b == 0xee));
         release(to);
+    }
+
+    /// A source page with PAGE_GUARD raises STATUS_GUARD_PAGE_VIOLATION in
+    /// the fast copy: it fails the copy like the kernel's would, it does not
+    /// end the process.
+    #[test]
+    fn a_guard_page_source_fails_the_copy() {
+        use windows_sys::Win32::System::Memory::PAGE_GUARD;
+        // SAFETY: a fresh allocation of two pages, freed below.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!base.is_null());
+        let mut old = 0;
+        // SAFETY: the second page of our allocation.
+        assert_ne!(unsafe { VirtualProtect(base.add(4096).cast(), 4096, PAGE_READWRITE | PAGE_GUARD, &mut old) }, 0);
+        let mut buf = [0u8; 16];
+        // SAFETY: the guarded page.
+        assert!(!super::read_into(unsafe { base.add(4096) }, &mut buf), "the guard page fails the copy");
+        assert!(super::read_into(base, &mut buf), "the page before it reads");
+        release(base);
+    }
+
+    /// The fast copy is a leaf that touches no stack: it has no unwind
+    /// information, so a stack walker takes the return address at `rsp`.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_fast_copy_uses_no_stack() {
+        // SAFETY: the function's own code, read up to its second `ret`
+        // (the fault path's): none of the opcodes below is in it.
+        let code = unsafe { std::slice::from_raw_parts(super::victory_copy_fast as *const u8, 64) };
+        let end = code.iter().enumerate().filter(|&(_, &b)| b == 0xc3).nth(1).map(|(i, _)| i).expect("two rets");
+        // push rdi, push rsi, pop rsi, pop rdi
+        assert!(code[..end].iter().all(|b| ![0x57, 0x56, 0x5e, 0x5f].contains(b)), "{:02x?}", &code[..=end]);
+    }
+
+    #[test]
+    fn overlapping_copies_preserve_data() {
+        let mut buf: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let expected = buf[..3000].to_vec();
+        // SAFETY: both slices lie within `buf` (overlapping with dst > src).
+        assert!(super::read(buf.as_ptr(), unsafe { buf.as_mut_ptr().add(500) }, 3000));
+        assert_eq!(&buf[500..3500], &expected[..]);
+    }
+
+    #[test]
+    fn batch_ranges_stay_disjoint_across_gaps_and_coalesce_within_page() {
+        let page = crate::watch::PAGE;
+        let mut tracked = Vec::new();
+        super::insert_range(&mut tracked, 0, 256, true);
+        super::insert_range(&mut tracked, 128 << 20, (128 << 20) + 256, true);
+        assert_eq!(tracked, [(0, 256), (128 << 20, (128 << 20) + 256)]);
+        // Another small range in the same 64 KiB page coalesces with the first.
+        super::insert_range(&mut tracked, 1024, 1280, true);
+        assert_eq!(tracked, [(0, 1280), (128 << 20, (128 << 20) + 256)]);
+        // A range in the next 64 KiB page stays separate.
+        super::insert_range(&mut tracked, page + 64, page + 128, true);
+        assert_eq!(
+            tracked,
+            [
+                (0, 1280),
+                (page + 64, page + 128),
+                (128 << 20, (128 << 20) + 256)
+            ]
+        );
+        assert!(super::range_covered(&tracked, 16, 128));
+        assert!(super::range_covered(&tracked, 128 << 20, (128 << 20) + 256));
+        assert!(!super::range_covered(&tracked, 2048, 4096));
+
+        // Untracked buffers only merge truly overlapping/adjacent byte ranges.
+        let mut untracked = Vec::new();
+        super::insert_range(&mut untracked, 0, 256, false);
+        super::insert_range(&mut untracked, 1024, 1280, false);
+        assert_eq!(untracked, [(0, 256), (1024, 1280)]);
+        super::insert_range(&mut untracked, 256, 1024, false);
+        assert_eq!(untracked, [(0, 1280)]);
+    }
+
+    /// A copy's refresh brings up to date what its ranges declare, not the
+    /// span between them: a page the title wrote between two declared ranges
+    /// is left for a submission that declares it (it stays changed). Kept
+    /// on purpose: the old bounding span refreshed it only by chance (a
+    /// view's size is what a shader may read), and across a 174 MB buffer's
+    /// ranges it was most of the copy cost.
+    #[test]
+    fn a_refresh_leaves_the_gap_between_its_declared_ranges() {
+        let page = crate::watch::PAGE;
+        let pool = crate::watch::tests::pool(3);
+        crate::shadow::register(pool, pool as u64, (3 * page) as u64);
+        let Some(copy) = crate::shadow::find(pool as u64, (3 * page) as u64) else {
+            crate::shadow::unregister(pool, pool as u64);
+            return; // no host GPU here
+        };
+        let host = |at: usize| copy.read_host((pool + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
+        copy.update(pool, 3 * page);
+        // The title writes a byte in each page; two ranges are declared.
+        for p in 0..3 {
+            // SAFETY: a byte of our pool.
+            unsafe { ((pool + p * page + 8) as *mut u8).write_volatile(0x40 + p as u8) };
+        }
+        let mut batch = super::Batch::default();
+        batch.add(&copy, pool, 64);
+        batch.add(&copy, pool + 2 * page, 64);
+        batch.flush();
+        assert_eq!([host(8), host(2 * page + 8)], [0x40, 0x42], "the declared ranges are current");
+        assert_eq!(host(page + 8), 0, "the gap is not copied");
+        // Declared later, it is.
+        batch.add(&copy, pool + page, 64);
+        batch.flush();
+        assert_eq!(host(page + 8), 0x41);
+        crate::shadow::unregister(pool, pool as u64);
+    }
+
+    #[test]
+    #[ignore = "throughput benchmark comparing fast VEH copy vs ReadProcessMemory"]
+    fn bench_copy_and_watch_throughput() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        const SIZE: usize = 64 << 10;
+        const ITERS: usize = 3200; // ~200 MB per frame (matches #400 world volume)
+        let src = vec![0x5Au8; SIZE];
+        let mut dst = vec![0u8; SIZE];
+
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            let mut done = 0;
+            // SAFETY: valid buffers of `SIZE`.
+            let ok = unsafe {
+                ReadProcessMemory(
+                    GetCurrentProcess(),
+                    src.as_ptr().cast(),
+                    dst.as_mut_ptr().cast(),
+                    SIZE,
+                    &mut done,
+                ) != 0
+            };
+            assert!(ok);
+            black_box(&dst);
+        }
+        let rpm_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        let t1 = Instant::now();
+        for _ in 0..ITERS {
+            assert!(super::read(src.as_ptr(), dst.as_mut_ptr(), SIZE));
+            black_box(&dst);
+        }
+        let fast_ms = t1.elapsed().as_secs_f64() * 1e3;
+
+        let p = crate::watch::tests::pool(64);
+        let tracked = crate::watch::track(p, 64 * BLOCK, true).unwrap();
+        let _ = tracked.take(p, p + 64 * BLOCK);
+        let t2 = Instant::now();
+        for _ in 0..35_000 {
+            black_box(tracked.take(p, p + 64 * BLOCK));
+        }
+        let watch_ms = t2.elapsed().as_secs_f64() * 1e3;
+        drop(tracked);
+        crate::watch::tests::free(p);
+
+        println!(
+            "200 MB copy ({ITERS}x64KiB): ReadProcessMemory = {rpm_ms:.2} ms, VEH copy_fast = {fast_ms:.2} ms ({:.1}x faster); 35k unchanged watch::take = {watch_ms:.2} ms",
+            rpm_ms / fast_ms
+        );
     }
 }
 

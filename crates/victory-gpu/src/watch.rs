@@ -35,6 +35,7 @@
 //! and allocated again while a tracker holds it is not seen.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The unit tracked and copied: 64 KiB, the console's page. Finer units
@@ -44,7 +45,16 @@ pub(crate) const PAGE: usize = 64 << 10;
 
 /// The pages a tracker has not taken since they changed, and what it saves
 /// of pages it armed.
-struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>);
+struct Changed {
+    pages: Mutex<BTreeSet<usize>>,
+    /// Exact count of `pages`, updated under `pages`'s lock so an empty
+    /// tracker skips the mutex and tree walk on the common unchanged path.
+    dirty: AtomicUsize,
+    saved: Mutex<Saved>,
+    /// True while `saved.bytes` is non-empty, so taking pages skips the
+    /// `saved` mutex when nothing is saved.
+    has_saved: AtomicBool,
+}
 
 /// Pages (page numbers) whose bytes a tracker keeps when they are first
 /// written after it took them, and those bytes: while shaders may be
@@ -57,21 +67,50 @@ struct Saved {
 }
 
 impl Changed {
-    /// Page `page` was taken: what it saved of it is stale.
-    fn taken(&self, page: usize) {
-        self.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page);
+    fn new(pages: BTreeSet<usize>) -> Self {
+        let count = pages.len();
+        Changed {
+            pages: Mutex::new(pages),
+            dirty: AtomicUsize::new(count),
+            saved: Mutex::default(),
+            has_saved: AtomicBool::new(false),
+        }
+    }
+
+    fn insert(&self, page: usize) -> bool {
+        let mut set = self.pages.lock().unwrap_or_else(|e| e.into_inner());
+        let added = set.insert(page);
+        if added {
+            self.dirty.fetch_add(1, Ordering::Release);
+        }
+        added
+    }
+
+    /// Pages were taken: what was saved of them is stale.
+    fn clear_saved(&self, pages: &[usize]) {
+        if pages.is_empty() || !self.has_saved.load(Ordering::Acquire) {
+            return;
+        }
+        let mut saved = self.saved.lock().unwrap_or_else(|e| e.into_inner());
+        for &page in pages {
+            saved.bytes.remove(&page);
+        }
+        if saved.bytes.is_empty() {
+            self.has_saved.store(false, Ordering::Release);
+        }
     }
 
     /// Page `page` is about to change for the first time since it was
     /// taken: its bytes now, if armed for it.
     fn save(&self, page: usize) {
-        let mut saved = self.1.lock().unwrap_or_else(|e| e.into_inner());
+        let mut saved = self.saved.lock().unwrap_or_else(|e| e.into_inner());
         if !saved.armed.contains(&page) || saved.bytes.contains_key(&page) {
             return;
         }
         let mut bytes = vec![0u8; PAGE].into_boxed_slice();
         if crate::host::read_into((page * PAGE) as *const u8, &mut bytes) {
             saved.bytes.insert(page, bytes);
+            self.has_saved.store(true, Ordering::Release);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SavedPages, 1);
         }
@@ -214,7 +253,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     install();
     let end = start + len;
     let pages = start / PAGE..end.div_ceil(PAGE);
-    let changed = Arc::new(Changed(Mutex::new(pages.clone().collect()), Mutex::default()));
+    let changed = Arc::new(Changed::new(pages.clone().collect()));
     let mut g = guards();
     for page in pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -291,13 +330,13 @@ impl Tracked {
     /// only partly in `[from, to)` is copied in part and stays changed.
     pub(crate) fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
         let (from, to) = (from.max(self.start), to.min(self.end));
-        if from >= to {
+        if from >= to || self.changed.dirty.load(Ordering::Acquire) == 0 {
             return Vec::new();
         }
         let pages: Vec<usize> = {
             #[cfg(feature = "diagnostics")]
             let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
-            let changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+            let changed = self.changed.pages.lock().unwrap_or_else(|e| e.into_inner());
             #[cfg(feature = "diagnostics")]
             drop(waited);
             changed.range(from / PAGE..to.div_ceil(PAGE)).copied().collect()
@@ -310,26 +349,39 @@ impl Tracked {
             .copied()
             .filter(|&p| (p * PAGE).max(self.start) >= from && ((p + 1) * PAGE).min(self.end) <= to)
             .collect();
-        // Every address showing the same pages is guarded too. A write in
-        // between marks them changed again; the copy, made after, has it.
-        #[cfg(feature = "diagnostics")]
-        let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
-        let mut g = guards();
-        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-        #[cfg(feature = "diagnostics")]
-        drop(waited);
-        #[cfg(feature = "diagnostics")]
-        let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
-        let others = aliases(&g, &whole);
-        guard_aliases(&mut g, &others);
-        #[cfg(feature = "diagnostics")]
-        drop(asked);
-        for page in protect(&mut g, &whole) {
-            changed.remove(&page);
-            self.changed.taken(page);
+        if !whole.is_empty() {
+            // Every address showing the same pages is guarded too. A write in
+            // between marks them changed again; the copy, made after, has it.
+            #[cfg(feature = "diagnostics")]
+            let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
+            let mut g = guards();
+            let mut changed = self.changed.pages.lock().unwrap_or_else(|e| e.into_inner());
+            #[cfg(feature = "diagnostics")]
+            drop(waited);
+            if !g.alias_of.is_empty() {
+                #[cfg(feature = "diagnostics")]
+                let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
+                let others = aliases(&g, &whole);
+                if !others.is_empty() {
+                    guard_aliases(&mut g, &others);
+                }
+                #[cfg(feature = "diagnostics")]
+                drop(asked);
+            }
+            let taken = protect(&mut g, &whole);
+            let mut removed = 0usize;
+            for &page in &taken {
+                if changed.remove(&page) {
+                    removed += 1;
+                }
+            }
+            if removed != 0 {
+                self.changed.dirty.fetch_sub(removed, Ordering::Release);
+            }
+            self.changed.clear_saved(&taken);
+            drop(changed);
+            drop(g);
         }
-        drop(changed);
-        drop(g);
         let mut runs: Vec<(usize, usize)> = Vec::new();
         for p in pages {
             let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
@@ -343,8 +395,11 @@ impl Tracked {
 
     /// Whether page `page` (a page number) changed since it was taken.
     pub(crate) fn changed(&self, page: usize) -> bool {
+        if self.changed.dirty.load(Ordering::Acquire) == 0 {
+            return false;
+        }
         self.changed
-            .0
+            .pages
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains(&page)
@@ -353,14 +408,30 @@ impl Tracked {
     /// The caller made pages (page numbers) of its copy equal to title
     /// memory itself (what shaders wrote went back): taken and guarded.
     pub(crate) fn taken(&self, pages: &[usize]) {
-        let mut g = guards();
-        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-        let others = aliases(&g, pages);
-        guard_aliases(&mut g, &others);
-        for page in protect(&mut g, pages) {
-            changed.remove(&page);
-            self.changed.taken(page);
+        if pages.is_empty() {
+            return;
         }
+        let mut g = guards();
+        let mut changed = self.changed.pages.lock().unwrap_or_else(|e| e.into_inner());
+        if !g.alias_of.is_empty() {
+            let others = aliases(&g, pages);
+            if !others.is_empty() {
+                guard_aliases(&mut g, &others);
+            }
+        }
+        let taken = protect(&mut g, pages);
+        let mut removed = 0usize;
+        for &page in &taken {
+            if changed.remove(&page) {
+                removed += 1;
+            }
+        }
+        if removed != 0 {
+            self.changed.dirty.fetch_sub(removed, Ordering::Release);
+        }
+        self.changed.clear_saved(&taken);
+        drop(changed);
+        drop(g);
     }
 
     /// Shaders may write the copy's bytes `[from, to)` until [`Tracked::disarm`]:
@@ -369,27 +440,46 @@ impl Tracked {
     pub(crate) fn arm(&self, from: usize, to: usize) {
         let (from, to) = (from.max(self.start), to.min(self.end));
         if from < to {
-            self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).armed.extend(from / PAGE..to.div_ceil(PAGE));
+            self.changed
+                .saved
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .armed
+                .extend(from / PAGE..to.div_ceil(PAGE));
         }
     }
 
     /// Page `page` (a page number) needs no saving any more: its copy-back
     /// is under way.
     pub(crate) fn unarm(&self, page: usize) {
-        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).armed.remove(&page);
+        self.changed
+            .saved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .armed
+            .remove(&page);
     }
 
     /// No shader writes the copy any more: nothing is armed or kept.
     pub(crate) fn disarm(&self) {
-        let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+        let mut saved = self.changed.saved.lock().unwrap_or_else(|e| e.into_inner());
         saved.armed.clear();
         saved.bytes.clear();
+        self.changed.has_saved.store(false, Ordering::Release);
     }
 
     /// The bytes page `page` (a page number) held when it was first written
     /// since it was taken, if it was armed then (and so changed).
     pub(crate) fn saved(&self, page: usize) -> Option<Box<[u8]>> {
-        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page)
+        if !self.changed.has_saved.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut saved = self.changed.saved.lock().unwrap_or_else(|e| e.into_inner());
+        let out = saved.bytes.remove(&page);
+        if saved.bytes.is_empty() {
+            self.changed.has_saved.store(false, Ordering::Release);
+        }
+        out
     }
 }
 
@@ -397,6 +487,9 @@ impl Tracked {
 /// now guarded or with nothing mapped (taken either way); a page that is
 /// mapped but cannot be guarded is left out (it stays changed).
 fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
+    if pages.is_empty() {
+        return Vec::new();
+    }
     #[cfg(feature = "diagnostics")]
     let counted = |calls: u64, pages: u64| {
         crate::copystat::add(crate::copystat::C::ProtectCalls, calls);
@@ -420,8 +513,17 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
         n == 0 || info.State != MEM_COMMIT
     };
     let mut taken = Vec::with_capacity(pages.len());
-    let busy = |page: usize| g.busy.iter().any(|&(a, b)| (a..b).contains(&page));
-    let pages: Vec<usize> = pages.iter().copied().filter(|&p| !busy(p)).collect();
+    let filtered: Vec<usize>;
+    let pages: &[usize] = if g.busy.is_empty() {
+        pages
+    } else {
+        filtered = pages
+            .iter()
+            .copied()
+            .filter(|&p| !g.busy.iter().any(|&(a, b)| (a..b).contains(&p)))
+            .collect();
+        &filtered
+    };
     let mut i = 0;
     while i < pages.len() {
         if g.protected.contains(&pages[i]) {
@@ -482,7 +584,7 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     }
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
-            let first_write = c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
+            let first_write = c.insert(page);
             if first_write && save {
                 c.save(page);
             }
@@ -581,10 +683,18 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     }
 }
 
+/// Ensures the vectored exception handler is installed (also used to recover
+/// from unmapped-page faults in [`crate::host`]'s fast user-space copy).
+pub(crate) fn ensure_installed() {
+    install();
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {
-    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+    use windows_sys::Win32::Foundation::{
+        EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_SINGLE_STEP, NTSTATUS,
+    };
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
         EXCEPTION_POINTERS,
@@ -592,6 +702,17 @@ fn install() {
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
+        // A fault inside the fast copy fails it, whatever it is (a guard page
+        // raises STATUS_GUARD_PAGE_VIOLATION): but a breakpoint or a step is
+        // the debugger's.
+        #[cfg(target_arch = "x86_64")]
+        if r.ExceptionCode != EXCEPTION_BREAKPOINT as NTSTATUS
+            && r.ExceptionCode != EXCEPTION_SINGLE_STEP as NTSTATUS
+            // SAFETY: the exception context is valid for the duration of the handler.
+            && crate::host::recover_copy(unsafe { &mut *(*info).ContextRecord })
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         const WRITE: usize = 1;
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
