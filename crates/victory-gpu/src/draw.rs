@@ -1705,12 +1705,17 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        // A listed frame: what the records held (after the clamp).
+        // A listed frame, or any frame for a traced shader: what the records
+        // held (after the clamp).
         #[cfg(feature = "diagnostics")]
-        if crate::capture::dump_on() {
-            let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
-            let name = crate::pipeline::shaders_of(pipeline);
-            crate::capture::read_indirect(list, (&args.buffer, args.offset(arguments)), count, (kind, stride, max), name);
+        {
+            let always = !crate::host::traced_shaders().is_empty()
+                && crate::host::is_traced(&crate::pipeline::shaders_of(pipeline));
+            if always || crate::capture::dump_on() {
+                let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                let name = crate::pipeline::shaders_of(pipeline);
+                crate::capture::read_indirect(list, (&args.buffer, args.offset(arguments)), count, (kind, stride, max), name, always);
+            }
         }
         crate::indirect::done(list, &args.buffer);
         if kind == DISPATCH {

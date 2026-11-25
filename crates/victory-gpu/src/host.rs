@@ -3464,19 +3464,34 @@ pub(crate) fn release_retired() {
 }
 
 /// Diagnostics: a noted command running a shader `VICTORY_TRACE_SHADERS`
-/// names (hashes, comma-separated) is logged with what it binds, the first
-/// 500.
+/// names (hashes, comma-separated) is logged with what it binds: all of
+/// them in listed capture frames, the first 500 elsewhere.
 #[cfg(feature = "diagnostics")]
 fn traced(what: &str) {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let hashes = HASHES.get_or_init(|| {
-        let v = std::env::var("VICTORY_TRACE_SHADERS").unwrap_or_default();
-        v.split(',').map(str::trim).filter(|h| !h.is_empty()).map(str::to_owned).collect()
-    });
-    if hashes.iter().any(|h| what.contains(h.as_str())) && LOGGED.fetch_add(1, Ordering::Relaxed) < 500 {
+    if is_traced(what)
+        && (crate::capture::listed(crate::queue::presented() + 1)
+            || LOGGED.fetch_add(1, Ordering::Relaxed) < 500)
+    {
         tracing::info!("traced command: {what}");
     }
+}
+
+/// The shader hashes `VICTORY_TRACE_SHADERS` lists (comma-separated;
+/// diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn traced_shaders() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        let v = std::env::var("VICTORY_TRACE_SHADERS").unwrap_or_default();
+        v.split(',').map(str::trim).filter(|h| !h.is_empty()).map(str::to_owned).collect()
+    })
+}
+
+/// Whether `what` names a shader [`traced_shaders`] lists.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn is_traced(what: &str) -> bool {
+    traced_shaders().iter().any(|h| what.contains(h.as_str()))
 }
 
 /// Diagnostics, `VICTORY_GPU_TIMING`: every command of the list during
