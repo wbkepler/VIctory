@@ -227,12 +227,17 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
 }
 
 /// A format as the host has it. The console's 16-bit depth with stencil
-/// (and its typeless views) has no PC format: the 24-bit ones stand in.
+/// (and its typeless views) has no PC format: the 32-bit float ones stand
+/// in, so that depth its shaders write through unordered views
+/// (`crate::twin`) arrives as the very float a draw rasterises; copied into
+/// 24-bit depth it never tested EQUAL against a draw on the RX 6700 XT.
+/// shortcut: a depth bias on such a target counts in float steps, not
+/// 1/65535; scale it if a title's 16-bit depth biased draws show acne.
 pub(crate) fn pc_format(format: u32) -> u32 {
     match format {
-        118 => 45,
-        119 => 46,
-        120 => 47,
+        118 => 20,
+        119 => 21,
+        120 => 22,
         other => other,
     }
 }
