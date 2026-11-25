@@ -596,6 +596,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
         target: super::Target::ANY,
         console_cf: false,
         per_lane_only: false,
+        gs: None,
     })
     .expect("lower");
     let shader = HostShader {

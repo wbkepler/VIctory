@@ -140,6 +140,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         target: super::Target::ANY,
         console_cf: false,
         per_lane_only: false,
+        gs: None,
     })
 }
 

@@ -197,6 +197,7 @@ fn build(
         target: super::Target::ANY,
         console_cf: false,
         per_lane_only: false,
+        gs: None,
     })
     .expect("lower");
     let shader = HostShader {

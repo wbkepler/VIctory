@@ -93,6 +93,7 @@ fn lower_as(
         target: super::Target::ANY,
         console_cf,
         per_lane_only: false,
+        gs: None,
     })
 }
 

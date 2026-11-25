@@ -296,6 +296,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         target: super::Target::ANY,
         console_cf: false,
         per_lane_only: false,
+        gs: None,
     })
     .map_err(e)?;
     Ok(HostShader {
