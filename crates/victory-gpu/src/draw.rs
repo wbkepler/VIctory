@@ -567,6 +567,11 @@ impl State {
         if list.take_rebind() {
             (self.host_pipeline, self.host_roots[1]) = (0, 0);
         }
+        // Compute work may write the arguments of indirect draws after it:
+        // they get a clamp of their own (`crate::indirect`).
+        if compute {
+            crate::indirect::end(list);
+        }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them. Title memory's views need a view heap: ours where
         // the title binds none (the BVH builder's dispatches may not).
@@ -634,6 +639,9 @@ impl State {
                 .flatten()
             {
                 list.defer_heap(&host.viewed);
+            }
+            if writes {
+                crate::indirect::wrote_anywhere(list);
             }
             crate::bindless::note_draw(writes);
         }
@@ -728,17 +736,17 @@ impl State {
             }
             for (views, kind) in [(&stage.root_cbvs, 0), (&stage.root_srvs, 1), (&stage.root_uavs, 2)] {
                 for &(slot, param) in views {
-                    let blocks = slot == victory_shader::emit::VIEW_BLOCKS;
-                    if kind == 1 && (blocks || slot == victory_shader::emit::VIEW_STRIDES) {
-                        // The bound view heap's stride table, or its block
+                    let slots = slot == victory_shader::emit::VIEW_SLOTS;
+                    if kind == 1 && (slots || slot == victory_shader::emit::VIEW_STRIDES) {
+                        // The bound view heap's stride table, or its slot
                         // table; without one the shader would read an
                         // unbound root view.
                         let heap = (self.heaps[0] != 0)
                             .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                             .flatten();
-                        let table = heap.and_then(|h| if blocks { h.blocks() } else { h.strides() });
+                        let table = heap.and_then(|h| if slots { h.slots() } else { h.strides() });
                         let Some(table) = table else {
-                            once!("a shader reads view strides or blocks without a view heap: dropped");
+                            once!("a shader reads view strides or slots without a view heap: dropped");
                             not_run("view strides without a view heap");
                             return false;
                         };
@@ -820,6 +828,7 @@ impl State {
                         l.SetGraphicsRootShaderResourceView(param, table);
                     }
                     if let Some(param) = stage.memory_dirty {
+                        crate::indirect::wrote_anywhere(list);
                         if compute {
                             l.SetComputeRootUnorderedAccessView(param, dirty);
                         } else {
@@ -1208,10 +1217,10 @@ impl State {
         }
         // Tables whose slots the host heap does not hold in one run are
         // made afresh: those reaching past a host heap smaller than the
-        // title's, and where the host holds the title's slots by blocks
-        // (its limit, 1,000,000 views on NVIDIA) those reaching into a
-        // block without host slots or across blocks that lie apart. A
-        // table the host holds elsewhere than the title is read there.
+        // title's. (Where the host caps its view heaps, 1,000,000 views on
+        // NVIDIA, shaders find each entry through the view-slot table:
+        // every table is read where the title has it.) A table the host
+        // holds elsewhere than the title is read there.
         let mut made = Vec::new();
         for (slot, table, first, last) in spans {
             let Some(heap) = self.heap_of(table) else {
@@ -1725,13 +1734,19 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        // Bounded first: a clamp binds a compute pipeline of its own (draws
+        // that join a batch record none, and keep what is bound).
+        let offset = args.offset(arguments);
+        let at = (args.gpu(arguments) - offset, offset, arguments);
+        let Some(bound) = crate::indirect::bounded(list, &args.buffer, at, (kind, stride, max), kind == DISPATCH)
+        else {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
+        };
+        if bound.replaced_compute() {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
         }
-        self.host_pipeline = 0;
-        self.host_roots[1] = 0;
         let ran = match kind {
             DRAW | INDEXED => {
                 (self.topology != RECTANGLES || self.completes_rectangles() || {
@@ -1747,7 +1762,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            bound.done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1779,14 +1794,19 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        // A listed frame: what the records held (after the clamp).
+        // A listed frame, or any frame for a traced shader: what the records
+        // held (after the clamp).
         #[cfg(feature = "diagnostics")]
-        if crate::capture::dump_on() {
-            let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
-            let name = crate::pipeline::shaders_of(pipeline);
-            crate::capture::read_indirect(list, (&args.buffer, args.offset(arguments)), count, (kind, stride, max), name);
+        {
+            let always = !crate::host::traced_shaders().is_empty()
+                && crate::host::is_traced(&crate::pipeline::shaders_of(pipeline));
+            if always || crate::capture::dump_on() {
+                let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                let name = crate::pipeline::shaders_of(pipeline);
+                crate::capture::read_indirect(list, (&args.buffer, args.offset(arguments)), count, (kind, stride, max), name, always);
+            }
         }
-        crate::indirect::done(list, &args.buffer);
+        bound.done(list, &args.buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -2116,6 +2136,128 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// Which pixels of a 64x64 host D32S8 `texture` (title texture `depth`)
+    /// pass an EQUAL depth test against a square (two triangles, as the
+    /// title's rectangles become) drawn over pixel `k - 1` (row by row) with
+    /// z = k times the title's 1/65535 (`0x37800080`), the depth
+    /// `VS_TiledLighting` gives draw k: entry `k - 1`.
+    fn equal_test_passes(depth: This, texture: &ID3D12Resource) -> Vec<bool> {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        const SOURCE: &str = r#"
+#define RS "RootFlags(0)"
+static const float2 CORNERS[6] = { float2(0, 0), float2(1, 0), float2(0, 1), float2(1, 0), float2(1, 1), float2(0, 1) };
+[RootSignature(RS)]
+float4 vs(uint v : SV_VertexID) : SV_Position {
+    uint i = v / 6;
+    float2 p = float2(i % 64, i / 64) + CORNERS[v % 6];
+    return float4(p.x / 32.0 - 1.0, 1.0 - p.y / 32.0, (float)(i + 1) * asfloat(0x37800080), 1.0);
+}
+uint ps() : SV_Target { return 1; }
+"#;
+        let host = crate::host::host().unwrap();
+        let blob = |entry: windows::core::PCSTR, target: windows::core::PCSTR| {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: the source and names outlive the call.
+            unsafe { D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("equal"), None, None, entry, target, 0, 0, &mut code, None) }.unwrap();
+            code.unwrap()
+        };
+        let (vs, ps) = (blob(s!("vs"), s!("vs_5_1")), blob(s!("ps"), s!("ps_5_1")));
+        // SAFETY: the blobs' own bytes.
+        let bytes = |b: &ID3DBlob| unsafe { D3D12_SHADER_BYTECODE { pShaderBytecode: b.GetBufferPointer(), BytecodeLength: b.GetBufferSize() } };
+        // SAFETY: a compiled shader with its root signature inside.
+        let root: ID3D12RootSignature = unsafe {
+            host.device.CreateRootSignature(0, std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize()))
+        }
+        .unwrap();
+        let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            // SAFETY: borrowed for the call.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            VS: bytes(&vs),
+            PS: bytes(&ps),
+            SampleMask: u32::MAX,
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 1,
+            DSVFormat: DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        desc.RTVFormats[0] = DXGI_FORMAT_R32_UINT;
+        desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xf;
+        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        desc.RasterizerState.DepthClipEnable = true.into();
+        desc.DepthStencilState.DepthEnable = true.into();
+        desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_EQUAL;
+        // SAFETY: a complete description.
+        let pso: ID3D12PipelineState = unsafe { host.device.CreateGraphicsPipelineState(&desc) }.unwrap();
+        let target_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R32_UINT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let mut target: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation.
+        unsafe {
+            host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &target_desc, D3D12_RESOURCE_STATE_RENDER_TARGET, None, &mut target)
+        }
+        .unwrap();
+        let target = target.unwrap();
+        let mut f = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0;
+        // SAFETY: outputs for one subresource.
+        unsafe { host.device.GetCopyableFootprints(&target_desc, 0, 1, 0, Some(&mut f), None, None, Some(&mut total)) };
+        let (raw, data) = host.shared_buffer(total).unwrap();
+        let list = host.new_list().unwrap();
+        crate::list::ensure_state(&list, depth, 0x10);
+        let dsv = D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        let (rtv, dsv) = (host.rtv(&target, None), host.dsv(texture, Some(&dsv)));
+        // SAFETY: an open list; the target in the render target state, the
+        // depth texture in the depth write state; copies into our buffer.
+        unsafe {
+            let l = &list.list;
+            l.ClearRenderTargetView(rtv, &[0.0; 4], None);
+            l.OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
+            l.RSSetViewports(&[D3D12_VIEWPORT { Width: 64.0, Height: 64.0, MaxDepth: 1.0, ..Default::default() }]);
+            l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { right: 64, bottom: 64, ..Default::default() }]);
+            l.SetGraphicsRootSignature(&root);
+            l.SetPipelineState(&pso);
+            l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            l.DrawInstanced(64 * 64 * 6, 1, 0, 0);
+            l.ResourceBarrier(&[crate::host::transition(&target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&raw),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&target),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        (0..64 * 64)
+            .map(|i| {
+                // SAFETY: inside the mapped buffer, by the footprint.
+                unsafe { (data.add(f.Offset as usize + (i / 64) * f.Footprint.RowPitch as usize + (i % 64) * 4) as *const u32).read() == 1 }
+            })
+            .collect()
+    }
+
     /// A title buffer of `bytes` in memory of its own.
     fn buffer(bytes: u64) -> This {
         let desc: [u32; 14] = [1, 0, 0, 0, bytes as u32, (bytes >> 32) as u32, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
@@ -2422,11 +2564,11 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 
     /// A depth texture with stencil (the console's 16-bit depth, the
-    /// host's 24-bit) written through unordered views of its planes, then
-    /// read as depth and stencil: the 16-bit depth arrives in 24 bits as
-    /// the host converts the same value, the stencil as written. Rendered
-    /// as depth (a clear), then used through the unordered view: back in
-    /// 16 bits.
+    /// host's 32-bit float) written through unordered views of its planes,
+    /// then read as depth and stencil: the 16-bit depth arrives as the
+    /// float the title's shaders compute for it, the stencil as written,
+    /// and a draw at that depth passes an EQUAL test. Rendered as depth (a
+    /// clear), then used through the unordered view: back in 16 bits.
     #[test]
     fn a_depth_texture_written_through_unordered_views_reads_as_depth() {
         let Some(host) = crate::host::host() else {
@@ -2513,7 +2655,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         list.close();
         host.execute(&[&list]);
-        let d24 = |u: u32| u * 256 + (u * 255 + 32767) / 65535;
+        // The title's float for 16-bit value u (its 1/65535 is 0x37800080).
+        let float = |u: u32| (u as f32 * f32::from_bits(0x3780_0080)).to_bits();
         for (x, y) in [(0usize, 0usize), (5, 0), (63, 2), (17, 40), (63, 63)] {
             let k = (1 + x + 64 * y) as u32;
             // SAFETY: inside the mapped buffers.
@@ -2528,15 +2671,22 @@ void main(uint3 id : SV_DispatchThreadID) {
                     raw_data.add(f[1].Offset as usize + y * f[1].Footprint.RowPitch as usize + x).read(),
                 )
             };
-            assert_eq!(word & 0xff_ffff, d24(k), "24-bit depth at {x},{y}");
+            assert_eq!(word, float(k), "depth at {x},{y}");
             assert_eq!(u32::from(byte), ((x ^ y) & 0xff) as u32);
         }
+        // Tested EQUAL against a point at the depth the title's tiled
+        // lighting gives value k (k times its 1/65535), as the console's
+        // 16-bit depth passes it for every k. In 24-bit depth on the RX 6700
+        // XT only k = 258 of 1..=4096 passed.
+        let passed = equal_test_passes(depth, &copy.texture);
+        let failed: Vec<u32> = (1..=4096).filter(|&k| !passed[k as usize - 1]).collect();
+        assert!(failed.is_empty(), "EQUAL fails at {failed:?}");
         // Rendered as depth (a clear of both planes), then used through
         // the unordered view: copied to the twin, converted back.
         list.reset();
         crate::list::ensure_state(&list, depth, 0x10);
         let dsv = D3D12_DEPTH_STENCIL_VIEW_DESC {
-            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D24_UNORM_S8_UINT,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
             ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
             ..Default::default()
         };

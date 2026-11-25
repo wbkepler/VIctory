@@ -497,8 +497,8 @@ pub(crate) struct CopyLocation {
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+/// buffer filled at submission; texture to buffer through readback memory
+/// ([`read_back`]).
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -522,8 +522,9 @@ extern "system" fn copy_texture_region(
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
+            if dst.kind == FOOTPRINT && src.kind != FOOTPRINT {
+                read_back(list, &dst, [x, y, z], &src, source_box);
+            }
             return;
         };
         let mut from = src;
@@ -605,6 +606,118 @@ extern "system" fn copy_texture_region(
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
+}
+
+/// Texture read backs since the last frame-rate line: how many, bytes
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) static READ_BACKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// (texture, buffer) pairs read back so far, each logged once (diagnostics).
+#[cfg(feature = "diagnostics")]
+static READ_BACK_PAIRS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Texture to buffer (a read back): the region is copied on the host into
+/// readback memory laid out as the title's footprint, and once the list has
+/// run its rows go into the title's buffer (the title reads them on the CPU
+/// after its fence).
+#[cfg(windows)]
+fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src: &CopyLocation, source_box: *const [u32; 6]) {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_BOX, D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+    };
+    use windows::core::Interface;
+    macro_rules! refused {
+        ($why:literal) => {{
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(concat!("texture to buffer copy refused: ", $why)));
+            return;
+        }};
+    }
+    let (Some(host), Some(texture)) = (crate::host::host(), crate::resource::host_resource(src.resource)) else {
+        refused!("no host texture");
+    };
+    // SAFETY: the title's box (same layout as the host's) or null; a live texture.
+    let (b, desc) = unsafe { (source_box.cast::<D3D12_BOX>().as_ref(), texture.GetDesc()) };
+    let size = match b {
+        Some(b) => [b.right.saturating_sub(b.left), b.bottom.saturating_sub(b.top), b.back.saturating_sub(b.front)],
+        None => {
+            // A subresource index shares the footprint's first dword.
+            let mip = src.footprint.offset as u32 % u32::from(desc.MipLevels.max(1));
+            let depth = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { u32::from(desc.DepthOrArraySize) } else { 1 };
+            [((desc.Width >> mip) as u32).max(1), (desc.Height >> mip).max(1), (depth >> mip).max(1)]
+        }
+    };
+    // The host takes footprints of 256-byte pitches only (as the console).
+    if !dst.footprint.row_pitch.is_multiple_of(256) {
+        refused!("a row pitch not a multiple of 256");
+    }
+    // shortcut: depth and stencil planes copy out in typeless formats of
+    // their own; refused until a title is seen reading one back.
+    if desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
+        refused!("a depth or stencil texture");
+    }
+    // The host copies into a footprint only within a buffer that holds all
+    // of it, so readback memory spans the footprint, not just the region.
+    let (Some(rows), Some(len)) = (dst.footprint.rows(at, size), dst.footprint.bytes()) else {
+        refused!("a region outside its footprint");
+    };
+    let (Some(title), Some((buffer, data))) = (buffer_range(dst.resource, dst.footprint.offset, len), list.readback(host, len)) else {
+        return;
+    };
+    if crate::texture::title_written(texture) {
+        crate::texture::upload(list, src.resource, texture);
+    }
+    ensure_state(list, src.resource, COPY_SOURCE);
+    let (mut to, mut from) = (*dst, *src);
+    to.resource = buffer.as_raw().cast_const().cast();
+    to.footprint.offset = 0;
+    from.resource = texture.as_raw().cast_const().cast();
+    #[cfg(feature = "diagnostics")]
+    {
+        let text = || {
+            let mem = crate::resource::texture_memory(src.resource).map_or(0, |(at, _)| at as usize);
+            format!(
+                "read back {:?} (mem {mem:#x}, {}x{} f{} sub {}) {size:?} at {at:?} into {:?}+{:#x}, {len} bytes",
+                src.resource,
+                desc.Width,
+                desc.Height,
+                desc.Format.0,
+                src.footprint.offset as u32,
+                dst.resource,
+                dst.footprint.offset
+            )
+        };
+        READ_BACKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        READ_BACKS[1].fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+        let pair = (src.resource as usize, dst.resource as usize);
+        let mut seen = READ_BACK_PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.contains(&pair) {
+            seen.push(pair);
+            tracing::info!("a texture read back (first of this pair): {}", text());
+        }
+        list.note_op(text);
+    }
+    // SAFETY: an open list; both locations in the host's layout, naming live
+    // resources; the region lies in the footprint (checked).
+    unsafe {
+        list.list.CopyTextureRegion(
+            (&raw const to).cast(),
+            at[0],
+            at[1],
+            at[2],
+            (&raw const from).cast(),
+            b.map(std::ptr::from_ref),
+        )
+    };
+    let (data, title) = (data as usize, title as usize);
+    list.defer_after(move || {
+        for &(at, n) in &rows {
+            let (at, n) = (at as usize, n as usize);
+            let _writing = crate::watch::writing(title + at, n);
+            crate::host::write_mapped((title + at) as *mut u8, (data + at) as *const u8, n);
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)] // the method's own arguments
@@ -786,7 +899,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
     {
         let len = len as usize;
-        list.defer(move || {
+        list.defer(dst as usize, len, move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
             {

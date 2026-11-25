@@ -3,7 +3,7 @@
 //! translate wrongly leaves whatever the memory held, and a draw of four
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So every record is clamped on the GPU,
-//! just before its execution, by a compute shader of ours (HLSL compiled by
+//! before its execution, by a compute shader of ours (HLSL compiled by
 //! the system's compiler; a 5.1 shader with its root signature inside).
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
@@ -11,10 +11,41 @@
 //! so a list of thousands of garbage records cannot run for seconds
 //! either.
 //!
+//! One clamp per execution costs the world's frames a compute dispatch, two
+//! barriers, two transitions and a pipeline change between every two of
+//! their thousands of indirect draws. With `VICTORY_INDIRECT_CLAMP=batch`
+//! consecutive indirect draws share one dispatch ([`bounded`]): it is recorded before the first of them and
+//! walks a table of jobs (offset, kind, stride, records) in the list's
+//! upload memory, which the draws after it add theirs to while the list is
+//! recorded. A record may join only while nothing recorded since the
+//! dispatch can have written it: compute work ends the batch ([`end`]),
+//! and so does a record in a range the list's draws declared they write
+//! since ([`wrote`], [`wrote_anywhere`]). Indirect dispatches are clamped
+//! alone, as before.
+//!
+//! The clamp's barriers also put a draw's shader writes before the next
+//! draw's reads. A draw that joins a batch after a draw that declared
+//! writes keeps that: a barrier alone is recorded before it.
+//!
+//! `VICTORY_INDIRECT_CLAMP`: `always` (the default) one clamp per
+//! execution, `batch` as above, `never` none (diagnostics: garbage
+//! arguments then hang the device).
+//!
+//! shortcut: batches are opt-in. They cut the world's GPU time by about a
+//! third on an RTX 5090, but one world run showed a skinned character with
+//! stretched triangles that per-execution clamps never showed, and what
+//! the batch misses has not been found; clamping before the draws that
+//! precede a record is the suspect.
+//!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
+//! shortcut: arguments the CPU wrote are clamped on the GPU too. Telling
+//! them apart needs the submission's order (lists are recorded before the
+//! submissions ahead of them have run, so title memory may still hold the
+//! bytes from before a shader's write), which a recorded list cannot act
+//! on any more.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -25,16 +56,20 @@ use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+#define RS_BATCH "UAV(u0), UAV(u1), SRV(t0)"
+cbuffer Record : register(b0) { uint one_kind; uint one_stride; uint one_records; uint unused; };
 RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
+// A batch's jobs: their count, then (16 bytes in) per job the offset of its
+// first record in `args`, its kind, stride and records.
+ByteAddressBuffer jobs : register(t0);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
-// Clamps the record at `at` in place; its cost.
-uint clamped(uint at) {
+// Clamps the record of `kind` at `at` in place; its cost.
+uint clamped(uint kind, uint at) {
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
@@ -66,19 +101,13 @@ groupshared uint costs[64];
 // record, then the first lane charges the tile's records in order. No
 // other group shares the budget: a shared add wraps once enough records
 // are rejected, and a compare-exchange retries more the more records fit.
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint lane : SV_GroupIndex) {
-    uint left = 0;
-    if (lane == 0) {
-        left = BUDGET - min(budget.Load(0), BUDGET);
-    }
+void walk(uint lane, uint base, uint kind, uint stride, uint records, inout uint left) {
     for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
         uint record = tile * 64 + lane;
-        uint at = record * stride;
+        uint at = base + record * stride;
         uint cost = 0;
         if (record < records) {
-            cost = clamped(at);
+            cost = clamped(kind, at);
         }
         costs[lane] = cost;
         GroupMemoryBarrierWithGroupSync();
@@ -100,6 +129,32 @@ void main(uint lane : SV_GroupIndex) {
             args.Store(at, 0);
         }
     }
+}
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint lane : SV_GroupIndex) {
+    uint left = 0;
+    if (lane == 0) {
+        left = BUDGET - min(budget.Load(0), BUDGET);
+    }
+    walk(lane, 0, one_kind, one_stride, one_records, left);
+    if (lane == 0) {
+        budget.Store(0, BUDGET - left);
+    }
+}
+// The same for every job of a batch, in the order their executions run.
+[RootSignature(RS_BATCH)]
+[numthreads(64, 1, 1)]
+void batch(uint lane : SV_GroupIndex) {
+    uint left = 0;
+    if (lane == 0) {
+        left = BUDGET - min(budget.Load(0), BUDGET);
+    }
+    uint count = jobs.Load(0);
+    for (uint job = 0; job < count; job++) {
+        uint4 j = jobs.Load4(16 + job * 16);
+        walk(lane, j.x, j.y, j.z, j.w, left);
+    }
     if (lane == 0) {
         budget.Store(0, BUDGET - left);
     }
@@ -109,6 +164,9 @@ void main(uint lane : SV_GroupIndex) {
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// The same for a batch's jobs.
+    batch_root: ID3D12RootSignature,
+    batch_pso: ID3D12PipelineState,
 }
 
 // SAFETY: D3D12 objects are free-threaded.
@@ -130,6 +188,13 @@ fn clamp() -> Option<&'static Clamp> {
 }
 
 fn make() -> windows::core::Result<Clamp> {
+    let (root, pso) = compile(s!("main"))?;
+    let (batch_root, batch_pso) = compile(s!("batch"))?;
+    Ok(Clamp { root, pso, batch_root, batch_pso })
+}
+
+/// The clamp's entry point `entry` as a pipeline, with its root signature.
+fn compile(entry: windows::core::PCSTR) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
@@ -141,7 +206,7 @@ fn make() -> windows::core::Result<Clamp> {
             s!("clamp"),
             None,
             None,
-            s!("main"),
+            entry,
             s!("cs_5_1"),
             0,
             0,
@@ -172,8 +237,278 @@ fn make() -> windows::core::Result<Clamp> {
             },
             ..Default::default()
         })?;
-        Ok(Clamp { root, pso })
+        Ok((root, pso))
     }
+}
+
+/// How records are clamped (`VICTORY_INDIRECT_CLAMP`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// One clamp per execution (the default).
+    Always,
+    /// One per batch of indirect draws.
+    Batch,
+    /// None (diagnostics).
+    Never,
+}
+
+fn mode() -> Mode {
+    static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = mode_of(std::env::var("VICTORY_INDIRECT_CLAMP").ok().as_deref());
+        if mode != Mode::Always {
+            tracing::info!(?mode, "indirect arguments' clamp (VICTORY_INDIRECT_CLAMP)");
+        }
+        mode
+    })
+}
+
+fn mode_of(value: Option<&str>) -> Mode {
+    match value.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("batch") => Mode::Batch,
+        Some(v) if v.eq_ignore_ascii_case("never") => Mode::Never,
+        _ => Mode::Always,
+    }
+}
+
+/// Clamp dispatches recorded and the executions they bound, since the last
+/// call (for the frame-rate line).
+pub(crate) fn take_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (CLAMPS.swap(0, Relaxed), BOUNDED.swap(0, Relaxed))
+}
+static CLAMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BOUNDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Why batches were opened (none open: the list's first indirect draw or
+/// the first after compute work; another argument buffer; shader writes
+/// anywhere; a written range over the record; the job tables' memory
+/// full), then the barriers recorded alone, since the last call.
+pub(crate) fn take_reasons() -> [u64; 6] {
+    std::array::from_fn(|i| REASONS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+static REASONS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+/// [`REASONS`]' entry for barriers recorded alone.
+const SYNCED: usize = 5;
+
+/// A list's batch of indirect draws under one clamp dispatch, and what its
+/// draws may have written since that dispatch.
+#[derive(Default)]
+pub(crate) struct Batches {
+    open: Option<Open>,
+    /// Title ranges `[from, to)` shaders may write that were declared since
+    /// the open batch's dispatch.
+    written: Vec<(u64, u64)>,
+    /// Shaders that write wherever they compute ran since (or more ranges
+    /// than are worth keeping): no record joins the batch any more.
+    anywhere: bool,
+    /// A draw declared shader writes since the last barrier: the next draw
+    /// that joins the batch gets one, as each had with a clamp of its own.
+    unsynced: bool,
+    /// Upload memory of the list the job tables come from: the CPU pointer,
+    /// the host address, and the bytes used and there.
+    block: (usize, u64, u64, u64),
+}
+
+/// The batch a list's indirect draws are joining.
+struct Open {
+    /// The argument buffer, in the indirect-argument state.
+    buffer: ID3D12Resource,
+    /// The job table (CPU): the count, then the jobs from 16 bytes in.
+    table: usize,
+    jobs: u32,
+}
+
+/// Ranges kept per batch; past them, every record starts a new batch.
+const WRITTEN: usize = 16;
+/// A job of a batch, and its table's header.
+const JOB: u64 = 16;
+/// The upload memory job tables are cut from, taken from the list.
+const BLOCK: u64 = 16 << 10;
+
+/// How an execution's records were bounded ([`bounded`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Bound {
+    /// By a clamp of their own: [`Bound::done`] returns the buffer.
+    Alone,
+    /// By a batch's clamp, recorded for them.
+    First,
+    /// By the open batch's clamp, recorded earlier.
+    Joined,
+    /// Not at all (`VICTORY_INDIRECT_CLAMP=never`).
+    Unclamped,
+}
+
+impl Bound {
+    /// Whether a clamp was recorded: the list's compute root signature and
+    /// pipeline are ours now (callers bind theirs after).
+    pub(crate) fn replaced_compute(self) -> bool {
+        matches!(self, Bound::Alone | Bound::First)
+    }
+
+    /// After the execution (or instead of it).
+    pub(crate) fn done(self, list: &HostList, buffer: &ID3D12Resource) {
+        if self == Bound::Alone {
+            done(list, buffer);
+        }
+    }
+}
+
+/// Shaders of a draw recorded in `list` may write title memory
+/// `[address, address + len)`: records there join no batch opened before.
+pub(crate) fn wrote(list: &HostList, address: u64, len: u64) {
+    let mut b = list.indirect();
+    if b.open.is_none() || len == 0 {
+        return;
+    }
+    b.unsynced = true;
+    if b.anywhere {
+        return;
+    }
+    let range = (address, address.saturating_add(len));
+    if b.written.contains(&range) {
+        return;
+    }
+    if b.written.len() == WRITTEN {
+        b.anywhere = true;
+    } else {
+        b.written.push(range);
+    }
+}
+
+/// Shaders of a draw recorded in `list` write wherever they compute.
+pub(crate) fn wrote_anywhere(list: &HostList) {
+    let mut b = list.indirect();
+    if b.open.is_some() {
+        b.anywhere = true;
+        b.unsynced = true;
+    }
+}
+
+/// Ends the list's batch, before compute work is recorded (it may write the
+/// arguments of draws after it) and before the list closes: the argument
+/// buffer goes back to unordered access.
+pub(crate) fn end(list: &HostList) {
+    let open = list.indirect().open.take();
+    if let Some(open) = open {
+        done(list, &open.buffer);
+    }
+}
+
+/// Bounds, in `list`, `records` records of `kind` (PC argument numbering)
+/// `stride` bytes apart, `offset` bytes into `buffer` (whose host address
+/// is `gpu`), title memory from `address` on, and leaves the buffer ready
+/// to be read as arguments. Draws join the list's batch or open one;
+/// `alone` (dispatches) get a clamp of their own. None if the clamp is not
+/// available: the execution must be dropped.
+pub(crate) fn bounded(
+    list: &HostList,
+    buffer: &ID3D12Resource,
+    at: (u64, u64, u64),
+    spec: (u32, u32, u32),
+    alone: bool,
+) -> Option<Bound> {
+    bounded_as(mode(), list, buffer, at, spec, alone)
+}
+
+fn bounded_as(
+    mode: Mode,
+    list: &HostList,
+    buffer: &ID3D12Resource,
+    (gpu, offset, address): (u64, u64, u64),
+    spec: (u32, u32, u32),
+    alone: bool,
+) -> Option<Bound> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (kind, stride, records) = spec;
+    let fits = u32::try_from(offset)
+        .ok()
+        .filter(|o| o.is_multiple_of(4) && gpu.is_multiple_of(4) && stride.is_multiple_of(4));
+    let offset32 = match (mode, fits) {
+        (Mode::Never, _) => {
+            end(list);
+            return Some(Bound::Unclamped);
+        }
+        (Mode::Batch, Some(o)) if !alone => o,
+        _ => {
+            end(list);
+            return bound(list, buffer, gpu + offset, spec).then_some(Bound::Alone);
+        }
+    };
+    let (c, budget) = (clamp()?, list.budget()?);
+    let (from, to) = (address, address.saturating_add(u64::from(stride) * u64::from(records.max(1))));
+    let mut b = list.indirect();
+    // The open batch's clamp ran before whatever the list recorded since:
+    // it bounds this record only if none of that can have written it.
+    let opened = match &b.open {
+        None => Some(0),
+        Some(o) if o.buffer != *buffer => Some(1),
+        _ if b.anywhere => Some(2),
+        _ if b.written.iter().any(|&(start, end)| start < to && from < end) => Some(3),
+        _ if b.block.2 + JOB > b.block.3 => Some(4),
+        _ => None,
+    };
+    let joins = opened.is_none();
+    if let Some(reason) = opened {
+        REASONS[reason].fetch_add(1, Relaxed);
+        if let Some(open) = b.open.take() {
+            done(list, &open.buffer);
+        }
+        // Room for the table's header and a job at least.
+        if b.block.2 + 2 * JOB > b.block.3 {
+            let (at, data) = list.scratch(BLOCK)?;
+            b.block = (data as usize, at, 0, BLOCK);
+        }
+        let (data, at, used, _) = b.block;
+        let table = data + used as usize;
+        // SAFETY: the list's own upload memory, inside the block; an open
+        // list, our root signature and pipeline, a live buffer the caller's
+        // list holds and list memory alive until it is reset.
+        unsafe {
+            (table as *mut [u32; 4]).write_volatile([0; 4]);
+            let l = &list.list;
+            // Earlier shader writes (the title's argument passes) first.
+            l.ResourceBarrier(&[uav_barrier()]);
+            l.SetComputeRootSignature(&c.batch_root);
+            l.SetPipelineState(&c.batch_pso);
+            l.SetComputeRootUnorderedAccessView(0, gpu);
+            l.SetComputeRootUnorderedAccessView(1, budget);
+            l.SetComputeRootShaderResourceView(2, at + used);
+            // One group walks every job's records.
+            l.Dispatch(1, 1, 1);
+            l.ResourceBarrier(&[
+                uav_barrier(),
+                transition(
+                    buffer,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                ),
+            ]);
+        }
+        b.block.2 += JOB;
+        b.open = Some(Open { buffer: buffer.clone(), table, jobs: 0 });
+        b.written.clear();
+        b.anywhere = false;
+        b.unsynced = false;
+        CLAMPS.fetch_add(1, Relaxed);
+    } else if b.unsynced {
+        // SAFETY: an open list.
+        unsafe { list.list.ResourceBarrier(&[uav_barrier()]) };
+        b.unsynced = false;
+        REASONS[SYNCED].fetch_add(1, Relaxed);
+    }
+    let at = b.block.0 + b.block.2 as usize;
+    b.block.2 += JOB;
+    let open = b.open.as_mut()?;
+    open.jobs += 1;
+    // SAFETY: the list's own upload memory, inside the block (checked
+    // above); the GPU reads it when the list runs.
+    unsafe {
+        (at as *mut [u32; 4]).write_volatile([offset32, kind, stride, records]);
+        (open.table as *mut u32).write_volatile(open.jobs);
+    }
+    BOUNDED.fetch_add(1, Relaxed);
+    Some(if joins { Bound::Joined } else { Bound::First })
 }
 
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
@@ -181,7 +516,7 @@ fn make() -> windows::core::Result<Clamp> {
 /// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
 /// the list's compute root signature and pipeline (callers bind theirs
 /// after). False if the clamp is not available.
-pub(crate) fn bound(
+fn bound(
     list: &HostList,
     buffer: &ID3D12Resource,
     gpu: u64,
@@ -195,6 +530,8 @@ pub(crate) fn bound(
     }
     let l = &list.list;
     let constants = [kind, stride, records, 0];
+    CLAMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    BOUNDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
@@ -221,7 +558,7 @@ pub(crate) fn bound(
 
 /// After the execution: the buffer back to unordered access, where the
 /// title's passes keep using it.
-pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
+fn done(list: &HostList, buffer: &ID3D12Resource) {
     // SAFETY: an open list and a live buffer.
     unsafe {
         list.list.ResourceBarrier(&[transition(
@@ -340,5 +677,62 @@ mod tests {
             return; // no host GPU here
         };
         assert!(twice.iter().all(|&count| count == 0));
+    }
+
+    /// Consecutive indirect draws share one clamp, which bounds all their
+    /// records; a draw whose records the list's shaders may have written
+    /// since that clamp gets a new one, and so does the first after compute
+    /// work. A record no draw names stays as written.
+    #[test]
+    fn consecutive_draws_share_one_clamp() {
+        use super::{Bound, Mode};
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        const RECORDS: usize = 8;
+        let (buffer, data) = host.shared_buffer(RECORDS as u64 * 16).unwrap();
+        let data = data.cast::<u32>();
+        let list = host.new_list().unwrap();
+        // Title addresses of the records (any: only their order matters).
+        let title = |record: u64| 0x10_0000 + record * 16;
+        // SAFETY: our mapped buffer, written before the list runs and read
+        // after it has; a live buffer.
+        unsafe {
+            // Garbage vertex counts, one instance each.
+            for at in 0..RECORDS * 4 {
+                data.add(at).write_volatile(if at % 4 == 1 { 1 } else { u32::MAX });
+            }
+            let gpu = buffer.GetGPUVirtualAddress();
+            let draw = |record: u64, records: u32| {
+                super::bounded_as(Mode::Batch, &list, &buffer, (gpu, record * 16, title(record)), (0, 16, records), false)
+            };
+            assert_eq!(draw(0, 1), Some(Bound::First));
+            assert_eq!(draw(1, 2), Some(Bound::Joined));
+            // A draw's shaders may write the fourth record: its clamp ran
+            // before they do.
+            super::wrote(&list, title(3), 16);
+            assert_eq!(draw(4, 1), Some(Bound::Joined));
+            assert_eq!(draw(3, 1), Some(Bound::First));
+            // Compute work ends the batch.
+            super::end(&list);
+            assert_eq!(draw(5, 1), Some(Bound::First));
+            assert_eq!(draw(6, 1), Some(Bound::Joined));
+            list.close();
+            host.execute(&[&list]);
+            for record in 0..RECORDS {
+                let words = [0, 1].map(|i| data.add(record * 4 + i).read_volatile());
+                let expected = if record < 7 { [1 << 24, 1] } else { [u32::MAX, 1] };
+                assert_eq!(words, expected, "record {record}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_clamp_switch_reads_its_three_values() {
+        use super::{Mode, mode_of};
+        assert_eq!(mode_of(None), Mode::Always);
+        assert_eq!(mode_of(Some("Always")), Mode::Always);
+        assert_eq!(mode_of(Some("batch")), Mode::Batch);
+        assert_eq!(mode_of(Some(" never ")), Mode::Never);
     }
 }

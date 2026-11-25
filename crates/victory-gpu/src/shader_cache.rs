@@ -81,19 +81,20 @@ fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
 
 /// [`build`] as this host's entries are keyed: a translation also depends
 /// on the host's view heaps where they are smaller than translations
-/// assume (`victory_shader::emit::set_view_heap`: `views` slots, which hold
-/// the title's by `blocks`). Elsewhere the build itself.
-fn host_build(build: &[u8; 32], views: u32, blocks: bool) -> [u8; 32] {
-    if (views, blocks) == (victory_shader::emit::HEAP_VIEWS, false) {
+/// assume (`victory_shader::emit::set_view_heap`: `views` slots, which the
+/// title's lead to through the view-slot table with `slots`). Elsewhere
+/// the build itself.
+fn host_build(build: &[u8; 32], views: u32, slots: bool) -> [u8; 32] {
+    if (views, slots) == (victory_shader::emit::HEAP_VIEWS, false) {
         return *build;
     }
     let mut h = blake3::Hasher::new();
     h.update(build);
     h.update(&views.to_le_bytes());
-    h.update(&[
-        u8::from(blocks),
-        victory_shader::emit::VIEW_BLOCK_SHIFT as u8,
-    ]);
+    // Not the keys of the translations that found the title's slots by
+    // blocks of 1,024 (a flag and the shift, 10).
+    h.update(&[u8::from(slots)]);
+    h.update(b"view slots");
     *h.finalize().as_bytes()
 }
 
@@ -122,14 +123,14 @@ pub fn host_shader(container: &[u8], target: Target) -> (Result<HostShader, Stri
     // The host first: making it says what its view heaps are like, which
     // translations depend on. Without a host they are as for most hosts.
     let _ = crate::host::host();
-    let (views, blocks) = (
+    let (views, slots) = (
         victory_shader::emit::heap_views(),
-        victory_shader::emit::view_blocks(),
+        victory_shader::emit::view_slots(),
     );
     match CACHE.get() {
         Some(cache) => cached(
             cache,
-            &target_key(&host_build(build(), views, blocks), target),
+            &target_key(&host_build(build(), views, slots), target),
             container,
             translate,
         ),
