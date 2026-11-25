@@ -552,6 +552,15 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        if compute
+            && p.stages
+                .iter()
+                .any(|s| s.memory.is_some() && reads_fifth_constant(&s.translated().host.user_data))
+        {
+            once!("a title-memory compute program reading a fifth root constant: dropped, as before");
+            not_run("title-memory compute reading a fifth root constant");
+            return false;
+        }
         let l = &list.list;
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
@@ -1965,6 +1974,18 @@ fn is_root_view_offset(u: &victory_shader::emit::UserData) -> bool {
     u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_VIEW_OFFSET
 }
 
+/// Whether a shader's user data takes the fifth dword of a root-constants
+/// parameter. Compute programs doing so in title memory (the console
+/// ray-tracing library's BVH build kernels) stay dropped as when that dword
+/// was taken for a root view's offset: run, they leave a later refit
+/// dispatch of the same library climbing without end (device hung at world
+/// load).
+fn reads_fifth_constant(user_data: &[victory_shader::emit::UserData]) -> bool {
+    user_data
+        .iter()
+        .any(|u| u.root == RootType::Constants && u.dword == victory_shader::emit::ROOT_VIEW_OFFSET)
+}
+
 /// Whether a shader reads root views through views the host makes.
 fn has_root_views(t: &victory_shader::emit::HostShader) -> bool {
     t.user_data.iter().any(is_root_view)
@@ -2205,6 +2226,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(is_root_view_offset(&u), dword == ROOT_VIEW_OFFSET);
             assert!(is_root_view(&u));
         }
+        assert!(reads_fifth_constant(&[entry(RootType::Constants, ROOT_VIEW_OFFSET)]));
+        assert!(!reads_fifth_constant(&[entry(RootType::Descriptor, ROOT_VIEW_OFFSET)]));
+        assert!(!reads_fifth_constant(&[entry(RootType::Constants, 3)]));
         // The fifth constant of a slot the title set constants at.
         let mut state = State::default();
         state.set_constants(true, 2, &[10, 11, 12, 13, 14, 15], 0);
