@@ -1056,6 +1056,14 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // Console groups of several waves that run as one host group each.
+        let Some(x) = x.checked_mul(p.regroup()).filter(|&x| x <= 65_535) else {
+            once!("a regrouped dispatch past the host's groups: dropped");
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(list, self.pipeline, "dispatch");
+            return;
+        };
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -1738,7 +1746,14 @@ impl State {
         // that join a batch record none, and keep what is bound).
         let offset = args.offset(arguments);
         let at = (args.gpu(arguments) - offset, offset, arguments);
-        let Some(bound) = crate::indirect::bounded(list, &args.buffer, at, (kind, stride, max), kind == DISPATCH)
+        // Console groups of several waves that run as one host group each:
+        // the clamp multiplies the records' X (and puts it back after).
+        let regroup = match crate::pipeline::host_pipeline(self.pipeline as This) {
+            Some(p) if kind == DISPATCH && p.compute => p.regroup(),
+            _ => 1,
+        };
+        let Some(bound) =
+            crate::indirect::bounded(list, &args.buffer, at, (kind, stride, max), kind == DISPATCH, regroup)
         else {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
@@ -1763,6 +1778,7 @@ impl State {
         };
         if !ran {
             bound.done(list, &args.buffer);
+            self.after_clamp(bound);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1807,12 +1823,23 @@ impl State {
             }
         }
         bound.done(list, &args.buffer);
+        self.after_clamp(bound);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
+    }
+
+    /// After [`crate::indirect::Bound::done`]: a regrouped dispatch's clamp
+    /// ran again after it, so the title's compute pipeline and root
+    /// arguments are bound anew next time.
+    fn after_clamp(&mut self, bound: crate::indirect::Bound) {
+        if matches!(bound, crate::indirect::Bound::Regrouped { .. }) {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
     }
 }
 

@@ -114,6 +114,7 @@ fn host_shader(lowered: lower::Lowered) -> HostShader {
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        regroup: lowered.regroup,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())

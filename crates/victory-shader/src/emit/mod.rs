@@ -357,6 +357,11 @@ pub struct HostShader {
     /// `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`] (module notes, "Write
     /// marks").
     pub view_marks: bool,
+    /// Compute: host thread groups per console group, along X (1: the
+    /// console's groups). A console group of several wave64s that share
+    /// nothing runs each wave as a host group of 64 threads on a host
+    /// without 64-lane waves; the host multiplies a dispatch's X by this.
+    pub regroup: u32,
 }
 
 impl HostShader {
@@ -709,6 +714,7 @@ pub fn emit_with(
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        regroup: l.regroup,
     })
 }
 
@@ -1069,6 +1075,7 @@ mod tests {
             heap: false,
             heap_writes: false,
             view_marks: false,
+            regroup: 1,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1086,6 +1093,7 @@ mod tests {
                 heap: false,
                 heap_writes: false,
                 view_marks: false,
+                regroup: 1,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1852,11 +1860,19 @@ mod tests {
         assert!(emit_for(&wave64, Target::ANY).is_ok());
         assert!(emit_for(&wave64, RDNA).is_ok());
         assert!(emit_for(&wave64, NVIDIA).is_ok());
-        // Two per group: the halves cannot meet at a group barrier yet.
+        // Two per group sharing nothing: on NVIDIA each console wave runs as
+        // a host group of its own.
         let two = compute_of(&words, true, 128);
-        assert!(emit_for(&two, RDNA).is_ok());
+        assert_eq!(emit_for(&two, RDNA).map(|s| s.regroup), Ok(1));
+        assert_eq!(emit_for(&two, NVIDIA).map(|s| s.regroup), Ok(2));
+        // Sharing LDS, they would need to meet at a group barrier: not yet.
+        let mut shared = two.clone();
+        let crate::native::StageIo::Cs(cs) = &mut shared.io else {
+            unreachable!()
+        };
+        cs.rsrc2 |= 1 << 15;
         assert_eq!(
-            emit_for(&two, NVIDIA),
+            emit_for(&shared, NVIDIA),
             Err(crate::ShaderError::Unsupported {
                 offset: 0,
                 what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
@@ -1902,9 +1918,10 @@ mod tests {
 
     /// On every hardware adapter: a wave64 program that reads other lanes
     /// translates in groups of one console wave (natively or in the console
-    /// flow) and the adapter takes it; in groups of two it translates
-    /// exactly when the adapter runs 64-lane waves. On a machine with an AMD
-    /// and an NVIDIA GPU this checks both answers.
+    /// flow) and the adapter takes it; in groups of two sharing nothing it
+    /// translates too, regrouped exactly when the adapter has no 64-lane
+    /// waves. On a machine with an AMD and an NVIDIA GPU this checks both
+    /// answers.
     #[test]
     #[cfg(windows)]
     fn each_adapter_gets_what_it_runs() {
@@ -1924,14 +1941,11 @@ mod tests {
                 emit_for(&compute(&words, true), target).unwrap_or_else(|e| panic!("{name}: {e}"));
             host.compute_pipeline(&one)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
-            match emit_for(&compute_of(&words, true, 128), target) {
-                Ok(cs) => {
-                    assert!(target.runs(64), "{name}");
-                    host.compute_pipeline(&cs)
-                        .unwrap_or_else(|e| panic!("{name}: {e}"));
-                }
-                Err(_) => assert!(!target.runs(64), "{name}"),
-            }
+            let two = emit_for(&compute_of(&words, true, 128), target)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(two.regroup, if target.runs(64) { 1 } else { 2 }, "{name}");
+            host.compute_pipeline(&two)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
     }
 
