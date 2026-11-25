@@ -220,8 +220,9 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
-    /// Root UAVs (raw buffers) read or written, likewise.
-    pub root_uavs: Vec<(u8, V)>,
+    /// Root UAVs (raw buffers) read or written, with whether globally coherent
+    /// and their handles.
+    pub root_uavs: Vec<(u8, bool, V)>,
     /// The title-memory page table's handle, once read.
     pub memory: Option<V>,
     /// The written-pages bitmap's handle, once title memory is written.
@@ -465,8 +466,8 @@ impl Shader {
     }
 
     /// The handle of the root UAV (a raw buffer) of root parameter `slot`.
-    pub fn root_uav_handle(&mut self, slot: u8) -> V {
-        if let Some(&(_, h)) = self.root_uavs.iter().find(|r| r.0 == slot) {
+    pub fn root_uav_handle(&mut self, slot: u8, coherent: bool) -> V {
+        if let Some(&(_, _, h)) = self.root_uavs.iter().find(|r| r.0 == slot) {
             return h;
         }
         let r = self.m.i32(u32::from(slot));
@@ -482,9 +483,10 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        let coh = if coherent { 0x4000 } else { 0 };
+        let h = self.annotate(block, h, 11 | 0x1000 | coh, 0);
         self.flags |= flags::RAW_BUFFERS;
-        self.root_uavs.push((slot, h));
+        self.root_uavs.push((slot, coherent, h));
         h
     }
 
@@ -820,15 +822,17 @@ impl Shader {
                 let u = self.m.undef(p);
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
+                let yes = self.m.bool(true);
+                let yes = self.m.md_value(yes);
                 let mut list = Vec::new();
-                let all: Vec<(u32, u32)> = self
+                let all: Vec<(u32, u32, bool)> = self
                     .root_uavs
                     .iter()
-                    .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
-                    .chain(self.memory_dirty.map(|_| (MEMORY_SPACE, 0)))
-                    .chain(self.view_writes.map(|_| (MEMORY_SPACE, VIEW_WRITES)))
+                    .map(|&(slot, coherent, _)| (ROOT_CBV_SPACE, u32::from(slot), coherent))
+                    .chain(self.memory_dirty.map(|_| (MEMORY_SPACE, 0, false)))
+                    .chain(self.view_writes.map(|_| (MEMORY_SPACE, VIEW_WRITES, false)))
                     .collect();
-                for (n, (space, slot)) in all.into_iter().enumerate() {
+                for (n, (space, slot, coherent)) in all.into_iter().enumerate() {
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
@@ -837,7 +841,7 @@ impl Shader {
                         Some(i32c(&mut self, slot)),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
-                        Some(no),
+                        Some(if coherent { yes } else { no }),
                         Some(no),
                         Some(no),
                         None,

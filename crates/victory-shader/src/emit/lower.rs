@@ -122,6 +122,9 @@ pub(crate) const CONSOLE_FLOW: &str = "a wave64 program whose halves exchange la
 pub(crate) const LANE_PHI_IN_CONSOLE_FLOW: &str =
     "a per-lane descriptor chosen by control flow in the console flow";
 
+const MULTI_WAVE_REFUSED: Why =
+    "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves";
+
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
@@ -248,8 +251,8 @@ struct Lower<'a> {
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     /// Handles of root SRVs and UAVs read as bounded views, by user-data
-    /// dword ([`Lower::root_view`]).
-    root_views: HashMap<u32, V>,
+    /// dword and global-coherence bit ([`Lower::root_view`]).
+    root_views: HashMap<(u32, bool), V>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -281,6 +284,8 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// The program has globally coherent (`glc`/`dlc`) memory accesses.
+    coherent_uavs: bool,
     /// [`Lowered::heap`], [`Lowered::heap_writes`].
     heap: [bool; 2],
     /// src0 of the current instruction as DPP fetched it.
@@ -310,6 +315,11 @@ struct Lower<'a> {
     /// group of 64 threads, `k` host groups along X per console group
     /// ([`Self::thread_id`], [`Self::group_id`]).
     regroup: Option<(u32, [u32; 3])>,
+    /// Multi-wave console flow (groups of `k > 1` wave64s with LDS or
+    /// barriers): IR blocks guaranteed to execute once per wave in lockstep
+    /// (post-dominate entry, not in any loop). Every `exchange()` and
+    /// `s_barrier` must lie in this set.
+    multi_wave_safe: Option<HashSet<usize>>,
     /// The console thread's flat id in the group (relabelled; see
     /// [`Self::thread_id`]).
     console_flat: Option<V>,
@@ -625,6 +635,53 @@ fn merged_wave_masks(p: &Program) -> HashSet<Value> {
     out
 }
 
+/// IR blocks reachable from entry (`0`) that lie in no cycle and
+/// post-dominate entry: every wave in a multi-wave group executes each of
+/// these blocks once, in step, so group barriers and cross-half exchanges
+/// placed here cannot deadlock or race across waves.
+fn multi_wave_safe_blocks(blocks: &[crate::ir::Block]) -> HashSet<usize> {
+    let order = crate::ir::reverse_postorder(blocks);
+    let exits: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|&b| blocks[b].exit.successors().is_empty())
+        .collect();
+    if exits.is_empty() {
+        return HashSet::new();
+    }
+    let reachable_from = |starts: &[usize], skip: Option<usize>| -> Vec<bool> {
+        let mut seen = vec![false; blocks.len()];
+        let mut stack = Vec::new();
+        for &s in starts {
+            if Some(s) != skip && !seen[s] {
+                seen[s] = true;
+                stack.push(s);
+            }
+        }
+        while let Some(u) = stack.pop() {
+            for v in blocks[u].exit.successors() {
+                if Some(v) != skip && !seen[v] {
+                    seen[v] = true;
+                    stack.push(v);
+                }
+            }
+        }
+        seen
+    };
+    let mut safe = HashSet::new();
+    for &b in &order {
+        let succs = blocks[b].exit.successors();
+        if reachable_from(&succs, None)[b] {
+            continue;
+        }
+        let reach_without_b = reachable_from(&[0], Some(b));
+        if exits.iter().all(|&e| !reach_without_b[e]) {
+            safe.insert(b);
+        }
+    }
+    safe
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, numeric_selects: bool) -> Self {
         let p = x.p;
@@ -639,8 +696,16 @@ impl<'a> Lower<'a> {
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
-            matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
-                && (i.name().contains("store") || i.name().contains("atomic"))
+            matches!(
+                i.fields,
+                Fields::Image { .. } | Fields::Buffer { .. } | Fields::Flat { .. }
+            ) && (i.name().contains("store") || i.name().contains("atomic"))
+        });
+        let coherent_uavs = insts().any(|i| match &i.fields {
+            Fields::Buffer { cache, .. } | Fields::Flat { cache, .. } | Fields::Smem { cache, .. } => {
+                cache.glc || cache.dlc
+            }
+            _ => false,
         });
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
@@ -649,6 +714,7 @@ impl<'a> Lower<'a> {
         let mut wants_console_flow = false;
         let mut no_console_flow = None;
         let mut regroup = None;
+        let mut multi_wave_safe = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -750,12 +816,20 @@ impl<'a> Lower<'a> {
                 && n.is_multiple_of(64)
                 && s.lds_dwords == 0
                 && !insts().any(|i| i.name() == "s_barrier");
+            // Multi-wave console flow: groups of `k > 1` full wave64s that
+            // share LDS or meet at barriers, within D3D12's 32 KiB
+            // groupshared cap (including 2 exchange dwords per console wave).
+            // Safety (exchanges and barriers in entry-post-dominating non-loop
+            // blocks) is enforced during lowering.
+            let multi_wave = x.native.wave64
+                && n > 64
+                && n.is_multiple_of(64)
+                && !regroupable
+                && (s.lds_dwords + 2 * (n / 64)) * 4 <= 32 * 1024;
             if needs_wave64 && !x.target.runs(64) {
                 let host_threads = if regroupable { 64 } else { n };
-                no_console_flow = if n > 64 && !regroupable {
-                    Some(
-                        "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
-                    )
+                no_console_flow = if n > 64 && !regroupable && !multi_wave {
+                    Some(MULTI_WAVE_REFUSED)
                 } else if insts()
                     .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
                 {
@@ -807,6 +881,8 @@ impl<'a> Lower<'a> {
                 if split && regroupable {
                     regroup = Some((n / 64, cs.threads));
                     s.threads = Some([64, 1, 1]);
+                } else if split && multi_wave {
+                    multi_wave_safe = Some(multi_wave_safe_blocks(&p.blocks));
                 }
             }
             if split {
@@ -924,6 +1000,7 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            coherent_uavs,
             heap: [false; 2],
             src0: None,
             console_lanes,
@@ -935,6 +1012,7 @@ impl<'a> Lower<'a> {
             wants_console_flow,
             no_console_flow,
             regroup,
+            multi_wave_safe,
             console_flat: None,
             xchg: None,
             flat: None,
@@ -1036,7 +1114,7 @@ impl<'a> Lower<'a> {
     /// from title memory at an address the program computes; stores and
     /// atomics through a root view.
     fn flat(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
-        let Fields::Flat { dst, .. } = &inst.fields else {
+        let Fields::Flat { dst, cache, .. } = &inst.fields else {
             unreachable!()
         };
         let name = inst.name();
@@ -1067,7 +1145,8 @@ impl<'a> Lower<'a> {
         let bytes = sub.map_or(4 * n, |(width, _)| width / 8);
         let (h, off) = if a.param == MEMORY {
             let (lo, hi) = self.global_address(inst)?;
-            let (h, off) = self.memory(lo, hi, bytes, false, guard);
+            let coh = cache.glc || cache.dlc;
+            let (h, off) = self.memory(lo, hi, bytes, false, coh, coh, guard);
             (Some(h), off)
         } else {
             let mut off = self.s.m.i32(a.offset);
@@ -1083,7 +1162,15 @@ impl<'a> Lower<'a> {
                     bits: 0,
                     words: [0, 0],
                 };
-                let (h, off) = self.raw_view((b, i), &src, off, bytes, (11, 0), false, guard)?;
+                let uav = self
+                    .used_kind(&src)
+                    .is_some_and(|u| u.kind == ResourceType::Uav);
+                let coh = uav && (cache.glc || cache.dlc);
+                let props = (
+                    11 | if uav { 0x1000 } else { 0 } | if coh { 0x4000 } else { 0 },
+                    0,
+                );
+                let (h, off) = self.raw_view((b, i), &src, off, bytes, props, false, guard)?;
                 (Some(h), off)
             }
         };
@@ -1219,6 +1306,7 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let d = data.as_ref().ok_or("global store data")?;
         let vals = self.vgprs(inst, d, n)?;
+        let coh = cache.glc || cache.dlc || ops.is_some();
         let (memory, root) = if a.param == MEMORY {
             (Some(self.global_address(inst)?), None)
         } else {
@@ -1240,7 +1328,8 @@ impl<'a> Lower<'a> {
                     (Some((lo, self.s.m.bin(self.cur, Bin::And, hi, mask))), None)
                 }
                 None => {
-                    let h = self.handle((b, i), &src, false, (11 | 0x1000, 0))?;
+                    let props = (11 | 0x1000 | if coh { 0x4000 } else { 0 }, 0);
+                    let h = self.handle((b, i), &src, false, props)?;
                     let off = match self.root_view_offset(&src) {
                         Some(at) => self.s.m.bin(self.cur, Bin::Add, off, at),
                         None => off,
@@ -1254,7 +1343,7 @@ impl<'a> Lower<'a> {
         // the lanes that write.
         let at = self.begin_guarded(guard);
         let (h, off) = match (memory, root) {
-            (Some((lo, hi)), _) => self.memory(lo, hi, 4 * u32::from(n), true, None),
+            (Some((lo, hi)), _) => self.memory(lo, hi, 4 * u32::from(n), true, true, coh, None),
             (_, Some(r)) => r,
             _ => unreachable!(),
         };
@@ -1558,7 +1647,7 @@ impl<'a> Lower<'a> {
                     &[arg, add, unsigned],
                 );
                 let total = bits(self, total);
-                let (lo, _) = self.exchange(c, total);
+                let (lo, _) = self.exchange(self.cur_ir, c, total)?;
                 let lo = value(self, lo);
                 let (_, half) = self.console_lane();
                 let zero = self.s.m.i32(0);
@@ -1570,7 +1659,7 @@ impl<'a> Lower<'a> {
                 return Ok(bits(self, r));
             }
             let r = bits(self, r);
-            let (lo, hi) = self.exchange(c, r);
+            let (lo, hi) = self.exchange(self.cur_ir, c, r)?;
             if float {
                 let (lo, hi) = (self.as_float(lo), self.as_float(hi));
                 let r = match op {
@@ -2065,12 +2154,13 @@ impl<'a> Lower<'a> {
     /// and root UAVs"); offsets from the root address move by
     /// [`Lower::root_view_offset`]. Host root views have no bounds; a view's
     /// reads past the copy give 0 and its writes there are dropped.
-    fn root_view(&mut self, param: usize, uav: bool) -> V {
+    fn root_view(&mut self, param: usize, uav: bool, coherent: bool) -> V {
         let rp = self.x.native.layout[param];
         // The descriptor's two user-data dwords hold its address on the
         // console; such a program never reads them as data (`user`).
         let index = u32::from(rp.user_data);
-        if let Some(&h) = self.root_views.get(&index) {
+        let coh = uav && coherent;
+        if let Some(&h) = self.root_views.get(&(index, coh)) {
             return h;
         }
         let i = self.user_at(UserData {
@@ -2079,9 +2169,13 @@ impl<'a> Lower<'a> {
             root: RootType::Descriptor,
             dword: if uav { super::ROOT_UAV_VIEW } else { super::ROOT_SRV_VIEW },
         });
-        let props = if uav { (11 | 0x1000, 0) } else { (11, 0) };
+        let props = if uav {
+            (11 | 0x1000 | if coh { 0x4000 } else { 0 }, 0)
+        } else {
+            (11, 0)
+        };
         let h = self.s.heap_handle(self.s.entry, i, false, false, props);
-        self.root_views.insert(index, h);
+        self.root_views.insert((index, coh), h);
         h
     }
 
@@ -2255,7 +2349,9 @@ impl<'a> Lower<'a> {
         let (lo, hi) = self.add64(lo, hi, off, false);
         let mask = self.s.m.i32(0xFFFF);
         let hi = self.s.m.bin(self.cur, Bin::And, hi, mask);
-        Ok(self.memory(lo, hi, bytes, write, active))
+        let uav = write || props.0 & 0x1000 != 0;
+        let coherent = uav && props.0 & 0x4000 != 0;
+        Ok(self.memory(lo, hi, bytes, write, uav, coherent, active))
     }
 
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
@@ -2272,13 +2368,13 @@ impl<'a> Lower<'a> {
             if let Some(&xy) = self.ballots.get(&lo) {
                 return Ok(if high { xy.1 } else { xy.0 });
             }
-            let at = match self.def_block.get(&lo) {
-                None => self.s.entry,
-                Some(&b) if b == self.cur_ir => self.cur,
-                Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+            let (ir_block, at) = match self.def_block.get(&lo) {
+                None => (0, self.s.entry),
+                Some(&b) if b == self.cur_ir => (b, self.cur),
+                Some(&b) => (b, self.tail[b].ok_or("a lane mask written after its use")?),
             };
             let bit = self.boolean(m, at)?;
-            let xy = self.console_ballot(at, bit);
+            let xy = self.console_ballot(ir_block, at, bit)?;
             self.ballots.insert(lo, xy);
             return Ok(if high { xy.1 } else { xy.0 });
         }
@@ -3525,10 +3621,10 @@ impl<'a> Lower<'a> {
 
     /// Console flow: `x` of console lane `lane` (uniform), from whichever
     /// half holds it.
-    fn console_read_lane(&mut self, x: V, lane: V) -> V {
+    fn console_read_lane(&mut self, x: V, lane: V) -> Result<V, Why> {
         if !self.split {
             // One host wave is the console wave, all of its lanes here.
-            return self.read_lane(x, lane);
+            return Ok(self.read_lane(x, lane));
         }
         let c = self.cur;
         let (k31, k5, one, z) = (
@@ -3539,11 +3635,11 @@ impl<'a> Lower<'a> {
         );
         let at = self.s.m.bin(c, Bin::And, lane, k31);
         let mine = self.read_lane(x, at);
-        let (x0, x1) = self.exchange(c, mine);
+        let (x0, x1) = self.exchange(self.cur_ir, c, mine)?;
         let h = self.s.m.bin(c, Bin::LShr, lane, k5);
         let h = self.s.m.bin(c, Bin::And, h, one);
         let low = self.s.m.cmp(c, pred::EQ, h, z);
-        self.s.m.select(c, low, x0, x1)
+        Ok(self.s.m.select(c, low, x0, x1))
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
@@ -3791,11 +3887,18 @@ impl<'a> Lower<'a> {
                 .s
                 .threads
                 .is_some_and(|t| t.iter().product::<u32>() > 32)
+            && self
+                .multi_wave_safe
+                .as_ref()
+                .is_none_or(|safe| safe.contains(&b))
         {
             // The console runs an instruction in all 64 lanes before the
             // next one. The halves are two host waves, both here (console
             // flow): a group barrier before each LDS access puts it after
-            // every earlier one, whichever half made it.
+            // every earlier one, whichever half made it. In a multi-wave
+            // group, an LDS access inside a branch body is ordered by the
+            // program's own `s_barrier` and cannot emit a group barrier
+            // inside divergent control flow.
             let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
             self.s
                 .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -4045,24 +4148,39 @@ impl<'a> Lower<'a> {
             || name.contains("store")
             || name.contains("atomic")
             || name == "s_barrier"
+            || name == "s_waitcnt_vscnt"
             || self.gs_ops.contains_key(&(b, i))
             || matches!(inst.fields, Fields::Ds { .. })
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
         let r = match &inst.fields {
+            Fields::Sop { imm, .. } if name == "s_waitcnt_vscnt" => {
+                if *imm == Some(0) {
+                    self.uav_fence();
+                }
+                Ok(())
+            }
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
-                // Thread-group sync with a shared-memory fence, and a UAV
-                // fence when the program writes UAVs (the waits before an
-                // s_barrier make those writes visible on the console).
-                let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
-                let mode = self.s.m.i32(mode);
-                let void = self.s.t.void;
-                self.s
-                    .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
-                Ok(())
+                if self
+                    .multi_wave_safe
+                    .as_ref()
+                    .is_some_and(|safe| !safe.contains(&b))
+                {
+                    Err(MULTI_WAVE_REFUSED)
+                } else {
+                    // Thread-group sync with a shared-memory fence, and a UAV
+                    // fence when the program writes UAVs (the waits before an
+                    // s_barrier make those writes visible on the console).
+                    let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
+                    let mode = self.s.m.i32(mode);
+                    let void = self.s.t.void;
+                    self.s
+                        .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                    Ok(())
+                }
             }
             Fields::Sopp { .. } if self.gs_ops.contains_key(&(b, i)) => self.gs_op(b, i),
             Fields::Sopp { .. } => Ok(()),
@@ -4086,6 +4204,18 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// A device-wide UAV memory fence (`DeviceMemoryBarrier`, DXIL barrier mode
+    /// `UAVFenceGlobal` = 2, without `SyncThreadGroup` so legal in divergent
+    /// control flow). Emitted only for compute/mesh stages that write UAVs.
+    fn uav_fence(&mut self) {
+        if self.writes_uavs && self.s.threads.is_some() {
+            let mode = self.s.m.i32(2);
+            let void = self.s.t.void;
+            self.s
+                .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
     }
 
@@ -4658,6 +4788,7 @@ impl<'a> Lower<'a> {
             data,
             offset,
             soffset,
+            cache,
             ..
         } = &inst.fields
         else {
@@ -4736,7 +4867,13 @@ impl<'a> Lower<'a> {
             && matches!(src, Source::Built { address, .. }
                 if self.x.native.layout.get(address.param).is_some_and(|p| p.root == RootType::Descriptor));
         if srv || root_uav {
-            let (h, addr) = self.raw_view(site, src, addr, 4 * count, (11, 0), false, None)?;
+            let props = if root_uav {
+                let coh = if cache.glc || cache.dlc { 0x4000 } else { 0 };
+                (11 | 0x1000 | coh, 0)
+            } else {
+                (11, 0)
+            };
+            let (h, addr) = self.raw_view(site, src, addr, 4 * count, props, false, None)?;
             let c = self.cur;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
@@ -5053,6 +5190,7 @@ impl<'a> Lower<'a> {
             base: Operand::Scalar { code: base, .. },
             offset,
             soffset,
+            cache,
             ..
         } = inst.fields
         else {
@@ -5076,7 +5214,8 @@ impl<'a> Lower<'a> {
         for (x, negative) in extra {
             (lo, hi) = self.add64(lo, hi, x, negative);
         }
-        let (h, off) = self.memory(lo, hi, 4 * count, false, None);
+        let coh = cache.glc || cache.dlc;
+        let (h, off) = self.memory(lo, hi, 4 * count, false, coh, coh, None);
         for k in 0..count {
             let four = self.s.m.i32(4 * k);
             let at = self.s.m.bin(self.cur, Bin::Add, off, four);
@@ -5209,15 +5348,19 @@ impl<'a> Lower<'a> {
     /// new block: callers take [`Lower::cur`] afresh.
     // shortcut: one lookup per access, so its bytes are taken to lie in one
     // host copy of title memory (any access within a 64 KiB page does).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn memory(
         &mut self,
         lo: V,
         hi: V,
         bytes: u32,
         write: bool,
+        uav: bool,
+        coherent: bool,
         active: Option<V>,
     ) -> (V, V) {
-        let e = self.memory_entry(lo, hi, write);
+        let uav = write || uav || coherent;
+        let e = self.memory_entry(lo, hi, uav, coherent);
         let c = self.cur;
         // Writes always mark (written or missed pages), reads only misses.
         let marks = match (write, active) {
@@ -5269,7 +5412,7 @@ impl<'a> Lower<'a> {
     }
 
     /// [`Self::memory`]'s lookup in the page table.
-    fn memory_entry(&mut self, lo: V, hi: V, write: bool) -> MemoryEntry {
+    fn memory_entry(&mut self, lo: V, hi: V, uav: bool, coherent: bool) -> MemoryEntry {
         let c = self.cur;
         let map = self.s.memory_handle();
         let k = |l: &mut Self, x: u32| l.s.m.i32(x);
@@ -5302,9 +5445,10 @@ impl<'a> Lower<'a> {
         let null = self.raw_dword(map, first);
         let miss = self.s.m.cmp(c, pred::EQ, view, null);
         // Views come in pairs: the raw SRV, then the raw UAV of one copy.
-        let (view, props) = if write {
+        let (view, props) = if uav {
             let one = k(self, 1);
-            (self.s.m.bin(c, Bin::Add, view, one), (11 | 0x1000, 0))
+            let coh = if coherent { 0x4000 } else { 0 };
+            (self.s.m.bin(c, Bin::Add, view, one), (11 | 0x1000 | coh, 0))
         } else {
             (view, (11, 0))
         };
@@ -5765,12 +5909,13 @@ impl<'a> Lower<'a> {
                     .iter()
                     .find(|u| u.user_data == rp.user_data)
                     .map(|u| u.kind);
-                match (rp.root, kind, props.0) {
+                let coherent = props.0 & 0x4000 != 0;
+                match (rp.root, kind, props.0 & !0x4000) {
                     (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
                         Ok(self.s.root_cbv_handle(rp.slot))
                     }
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) if !self.root_memory => {
-                        Ok(self.root_view(address.param, false))
+                        Ok(self.root_view(address.param, false, false))
                     }
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
                         Ok(self.s.root_srv_handle(rp.slot))
@@ -5779,11 +5924,11 @@ impl<'a> Lower<'a> {
                     | (RootType::Descriptor, Some(ResourceType::Uav), 11)
                         if !self.root_memory =>
                     {
-                        Ok(self.root_view(address.param, true))
+                        Ok(self.root_view(address.param, true, coherent))
                     }
                     (RootType::Descriptor, Some(ResourceType::Uav) | None, 0x100B)
                     | (RootType::Descriptor, Some(ResourceType::Uav), 11) => {
-                        Ok(self.s.root_uav_handle(rp.slot))
+                        Ok(self.s.root_uav_handle(rp.slot, self.coherent_uavs))
                     }
                     _ => Err("a root UAV or typed root view"),
                 }
@@ -6960,7 +7105,7 @@ impl<'a> Lower<'a> {
                     self.cross_lane(false)?;
                 }
                 let r = if self.console_cf {
-                    self.console_read_lane(a, lane)
+                    self.console_read_lane(a, lane)?
                 } else {
                     self.read_lane(a, lane)
                 };
@@ -7024,7 +7169,7 @@ impl<'a> Lower<'a> {
                 let fhi = self.s.m.select(c, none_hi, z, fhi);
                 let some_lo = self.s.m.cmp(c, pred::NE, lo, z);
                 let first = self.s.m.select(c, some_lo, flo, fhi);
-                let r = self.console_read_lane(a, first);
+                let r = self.console_read_lane(a, first)?;
                 int(self, r)
             }
             "v_readfirstlane_b32" => {
@@ -9556,6 +9701,7 @@ impl<'a> Lower<'a> {
             format,
             lds,
             tfe,
+            cache,
             ..
         } = &inst.fields
         else {
@@ -9565,12 +9711,8 @@ impl<'a> Lower<'a> {
         if name == "buffer_gl0_inv" || name == "buffer_gl1_inv" {
             // Console cache coherence: gl0 writes back and invalidates the
             // per-CU shader L0, gl1 invalidates GL1, so one wavefront's
-            // writes become visible to others. D3D12 already guarantees UAV
-            // coherence across wavefronts and dispatches, DXIL has no
-            // equivalent instruction, and this project's host-visible
-            // writeback comes from command-stream GpuWrite ranges rather
-            // than shader cache hints. Ordering is kept by the surrounding
-            // s_waitcnt/s_barrier, which the translator does lower.
+            // writes become visible to others. Emit a device-wide UAV fence.
+            self.uav_fence();
             return Ok(());
         }
         if *lds || *tfe {
@@ -9739,7 +9881,8 @@ impl<'a> Lower<'a> {
             index => index,
         };
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
+        let coherent = uav && (cache.glc || cache.dlc || atomic.is_some());
+        let u = if uav { 0x1000 } else { 0 } | if coherent { 0x4000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
@@ -9815,7 +9958,7 @@ impl<'a> Lower<'a> {
             let mask = self.s.m.bin(c, Bin::Shl, field, sh);
             let all = self.s.m.i32(u32::MAX);
             let keep = self.s.m.bin(c, Bin::Xor, mask, all);
-            let (h, at) = self.raw_view(site, src, at, 4, (11 | 0x1000, 0), true, guard)?;
+            let (h, at) = self.raw_view(site, src, at, 4, (11 | u, 0), true, guard)?;
             let begin = self.begin_guarded(guard);
             let i32t = self.s.t.i32;
             for (op, v) in [(1, keep), (2, x)] {
@@ -10481,17 +10624,17 @@ impl<'a> Lower<'a> {
     fn any_lane(&mut self, m: Bool) -> Result<V, Why> {
         let c = self.cur;
         let bit = self.boolean(m, c)?;
-        let (lo, hi) = self.console_ballot(c, bit);
+        let (lo, hi) = self.console_ballot(self.cur_ir, c, bit)?;
         let or = self.s.m.bin(c, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(c, pred::NE, or, z))
     }
 
     /// Console flow: the console wave's ballot of `bit`, low and high word.
-    fn console_ballot(&mut self, at: usize, bit: V) -> (V, V) {
+    fn console_ballot(&mut self, ir_block: usize, at: usize, bit: V) -> Result<(V, V), Why> {
         if self.split {
             let word = self.ballot_word(at, bit);
-            return self.exchange(at, word);
+            return self.exchange(ir_block, at, word);
         }
         // One host wave is the console wave (the high word is 0 in waves
         // of 32).
@@ -10501,7 +10644,7 @@ impl<'a> Lower<'a> {
             .s
             .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
         self.s.flags |= flags::WAVE_OPS;
-        (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1))
+        Ok((self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1)))
     }
 
     /// The host wave's ballot of `bit` (32 lanes: the first word).
@@ -10568,41 +10711,64 @@ impl<'a> Lower<'a> {
 
     /// Console flow: each half gives `x` (the same in all its lanes) and
     /// both get (the lower half's, the upper half's): through two group-
-    /// shared dwords between group barriers, which every thread of the
-    /// group reaches (see [`CONSOLE_FLOW`]). A group of 32 threads or
-    /// fewer has no upper half: its lanes count as inactive there (0).
-    fn exchange(&mut self, at: usize, x: V) -> (V, V) {
+    /// shared dwords per console wave between group barriers, which every
+    /// thread of the group reaches (see [`CONSOLE_FLOW`]). A group of 32
+    /// threads or fewer has no upper half: its lanes count as inactive
+    /// there (0).
+    fn exchange(&mut self, ir_block: usize, at: usize, x: V) -> Result<(V, V), Why> {
+        if self
+            .multi_wave_safe
+            .as_ref()
+            .is_some_and(|safe| !safe.contains(&ir_block))
+        {
+            return Err(MULTI_WAVE_REFUSED);
+        }
         let threads: u32 = self.s.threads.expect("compute").iter().product();
         let z = self.s.m.i32(0);
         if threads <= 32 {
-            return (x, z);
+            return Ok((x, z));
         }
+        let waves = threads / 64;
         let (_, half) = self.console_lane();
         let slots = match self.xchg {
             Some(g) => g,
             None => {
-                let arr = self.s.m.array(2, self.s.t.i32);
+                let arr = self.s.m.array((waves * 2).max(2), self.s.t.i32);
                 let g = self.s.m.global("xchg", arr, 3);
                 self.xchg = Some(g);
                 g
             }
         };
+        let one = self.s.m.i32(1);
+        let (mine_idx, p0_idx, p1_idx) = if waves <= 1 {
+            (half, z, one)
+        } else {
+            let e = self.s.entry;
+            let flat = self.console_flat();
+            let k6 = self.s.m.i32(6);
+            let wave_idx = self.s.m.bin(e, Bin::LShr, flat, k6);
+            let base = self.s.m.bin(e, Bin::Shl, wave_idx, one);
+            (
+                self.s.m.bin(e, Bin::Or, base, half),
+                base,
+                self.s.m.bin(e, Bin::Or, base, one),
+            )
+        };
         let void = self.s.t.void;
         // Thread-group sync with a group-shared memory fence.
         let mode = self.s.m.i32(1 | 8);
-        let mine = self.s.m.element(at, slots, half);
+        let mine = self.s.m.element(at, slots, mine_idx);
         self.s.m.store(at, mine, x);
         self.s
             .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
-        let one = self.s.m.i32(1);
-        let p0 = self.s.m.element(at, slots, z);
-        let p1 = self.s.m.element(at, slots, one);
+        let p0 = self.s.m.element(at, slots, p0_idx);
+        let p1 = self.s.m.element(at, slots, p1_idx);
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
         // Both read before the next exchange writes.
         self.s
             .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
-        (lo, hi)
+        Ok((lo, hi))
     }
 
     /// A forward edge into loop header `to` (from DXIL block `via`) starts

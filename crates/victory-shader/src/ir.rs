@@ -678,10 +678,11 @@ fn remove_trivial_phis_steps(blocks: &mut [Block], values: u32) -> usize {
 }
 
 /// Scheduling hints, performance counters and tracing: no effect on results.
+/// (`s_waitcnt_vscnt` is kept: it orders vector stores before following
+/// atomics or loads and lowers to a global UAV fence.)
 const DROPPED: &[&str] = &[
     "s_nop",
     "s_waitcnt",
-    "s_waitcnt_vscnt",
     "s_waitcnt_vmcnt",
     "s_waitcnt_expcnt",
     "s_waitcnt_lgkmcnt",

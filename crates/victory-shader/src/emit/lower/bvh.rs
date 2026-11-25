@@ -269,7 +269,7 @@ impl Lower<'_> {
         let mask = self.s.m.i32(0xFFFF);
         let hi = self.s.m.bin(c, Bin::And, hi, mask);
         // A node (64 bytes, 64-byte aligned) lies in one 64 KiB page.
-        let (h, at) = self.memory(lo, hi, 4 * dwords, false, None);
+        let (h, at) = self.memory(lo, hi, 4 * dwords, false, false, false, None);
         let c = self.cur;
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let mut out = Vec::new();

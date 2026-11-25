@@ -1865,16 +1865,35 @@ mod tests {
         let two = compute_of(&words, true, 128);
         assert_eq!(emit_for(&two, RDNA).map(|s| s.regroup), Ok(1));
         assert_eq!(emit_for(&two, NVIDIA).map(|s| s.regroup), Ok(2));
-        // Sharing LDS, they would need to meet at a group barrier: not yet.
+        // Sharing LDS with all exchanges/barriers in straight-line flow:
+        // translates on NVIDIA as one multi-wave group (`regroup == 1`).
         let mut shared = two.clone();
         let crate::native::StageIo::Cs(cs) = &mut shared.io else {
             unreachable!()
         };
         cs.rsrc2 |= 1 << 15;
+        assert_eq!(emit_for(&shared, NVIDIA).map(|s| s.regroup), Ok(1));
+        // Multi-wave with a barrier inside a conditional branch: still refused.
+        let branchy = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+            0xBF88_0001, // s_cbranch_execz +1 (skips s_barrier)
+            0xBF8A_0000, // s_barrier
+            0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+            0xD760_0000,
+            0x0001_0B00, // v_readlane_b32 s0, v0, 5
+            0x7E02_0200, // v_mov_b32 v1, s0
+            0xBF81_0000, // s_endpgm
+        ];
+        let mut cond_shared = compute_of(&branchy, true, 128);
+        let crate::native::StageIo::Cs(cs) = &mut cond_shared.io else {
+            unreachable!()
+        };
+        cs.rsrc2 |= 1 << 15;
         assert_eq!(
-            emit_for(&shared, NVIDIA),
+            emit_for(&cond_shared, NVIDIA),
             Err(crate::ShaderError::Unsupported {
-                offset: 0,
+                offset: 12,
                 what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
             })
         );
