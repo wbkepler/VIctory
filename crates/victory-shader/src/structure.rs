@@ -658,8 +658,8 @@ impl<'a> Lanes<'a> {
         for block in blocks {
             if let Exit::Branch { taken, not_taken } = block.exit
                 && let Some(last) = block.insts.last()
-                && l.discards(last)
-                && (l.kill_exit(taken) || l.kill_exit(not_taken))
+                && let Some(live) = l.discards(last)
+                && (l.kill_exit(taken, live) || l.kill_exit(not_taken, live))
                 && let Some(def) = last.read(Reg::Scc).and_then(|v| l.defs.get(&v))
             {
                 l.kills.insert(*def);
@@ -800,14 +800,15 @@ impl<'a> Lanes<'a> {
                 let mut w = self.branch(last);
                 // A discard's "no lane is left" exit: no lane takes it (the
                 // live mask keeps every lane, see `kills`).
-                if last
-                    .read(Reg::Scc)
-                    .and_then(|v| self.defs.get(&v))
-                    .is_some_and(|d| self.kills.contains(d))
+                if let Some(live) = self.discards(last)
+                    && last
+                        .read(Reg::Scc)
+                        .and_then(|v| self.defs.get(&v))
+                        .is_some_and(|d| self.kills.contains(d))
                 {
-                    if self.kill_exit(taken) {
+                    if self.kill_exit(taken, live) {
                         w = Bool::FALSE;
-                    } else if self.kill_exit(not_taken) {
+                    } else if self.kill_exit(not_taken, live) {
                         w = Bool::TRUE;
                     }
                 }
@@ -1326,39 +1327,58 @@ impl<'a> Lanes<'a> {
     }
 
     /// Whether `inst` branches on the SCC of `s_andn2 X, X, exec`: whether
-    /// any lane is left in a pixel's live mask after a discard.
-    fn discards(&self, inst: &Inst) -> bool {
+    /// any lane is left in a pixel's live mask after a discard. `X`'s
+    /// operand code if so.
+    fn discards(&self, inst: &Inst) -> Option<u8> {
         if !inst.name().starts_with("s_cbranch_scc") {
-            return false;
+            return None;
         }
-        let Some(&(db, di)) = inst.read(Reg::Scc).and_then(|v| self.defs.get(&v)) else {
-            return false;
-        };
+        let &(db, di) = inst.read(Reg::Scc).and_then(|v| self.defs.get(&v))?;
         let def = &self.p.blocks[db].insts[di];
         let Fields::Sop {
-            dst: Some(d), src, ..
+            dst: Some(d @ Operand::Scalar { code, .. }),
+            src,
+            ..
         } = &def.fields
         else {
-            return false;
+            return None;
         };
-        matches!(def.name(), "s_andn2_b32" | "s_andn2_b64")
+        (matches!(def.name(), "s_andn2_b32" | "s_andn2_b64")
             && src.first() == Some(d)
-            && matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. }))
+            && matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. })))
+        .then_some(*code)
     }
 
     /// Whether a lane entering block `b` leaves the program doing nothing but
-    /// scalar work and a `done` export to `null` (a discard's exit).
-    fn kill_exit(&self, mut b: usize) -> bool {
+    /// scalar work and a `done` export to `null` (a discard's exit, `live`
+    /// the operand code of the live mask the discard emptied).
+    ///
+    /// An end that first gives EXEC a saved mask other than `live` exports
+    /// those lanes as valid: a pixel program with no color output ending
+    /// normally, after a loop that leaves through the same test on its own
+    /// exit mask (`s_andn2 X, X, exec`, then its SCC). Taken for a discard,
+    /// that loop's lanes would never leave it (only the loop limit ends it,
+    /// about 0.2 s a draw on the host).
+    fn kill_exit(&self, mut b: usize, live: u8) -> bool {
         for _ in 0..8 {
             let block = &self.p.blocks[b];
             let mut null_done = false;
             for inst in &block.insts {
-                match inst.fields {
+                match &inst.fields {
                     Fields::Exp {
                         target: 9,
                         done: true,
                         ..
                     } => null_done = true,
+                    Fields::Sop {
+                        dst: Some(Operand::Scalar { code: EXEC, .. }),
+                        src,
+                        ..
+                    } if inst.name().starts_with("s_mov_b")
+                        && matches!(src.first(), Some(&Operand::Scalar { code, .. }) if code != live) =>
+                    {
+                        return false;
+                    }
                     Fields::Sop { .. } | Fields::Sopp { .. } => {}
                     _ => return false,
                 }
@@ -1481,6 +1501,65 @@ mod tests {
 
     fn guarded(s: &Structured) -> usize {
         s.guards.iter().flatten().filter(|g| g.is_some()).count()
+    }
+
+    /// `exp null done vm`: a pixel program's end with no color output.
+    const EXP_NULL_DONE: [u32; 2] = [0xF800_1890, 0x0000_0000];
+
+    /// A loop that leaves through `s_andn2 X, X, exec` and its SCC to a
+    /// program end with no output (a pixel program that only writes
+    /// through atomics), which gives EXEC back the mask saved before the
+    /// loop, is a loop, not a discard: taken as a discard, the back edge was
+    /// always taken and every lane ran to the loop limit.
+    #[test]
+    fn a_loop_exit_to_a_null_export_is_no_discard() {
+        let mut words = vec![
+            0xBE89_037E, // s_mov_b32 s9, exec_lo
+            0xBE88_037E, // s_mov_b32 s8, exec_lo
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBF82_0001, // s_branch -> body
+            0xBEFE_0308, // header: s_mov_b32 exec_lo, s8
+            0x4A02_0281, // body: v_add_nc_u32 v1, 1, v1
+            0x7DA2_0283, // v_cmpx_lt_u32 exec, 3, v1 (the lanes done)
+            0x8A08_7E08, // s_andn2_b32 s8, s8, exec_lo
+            0xBF85_FFFB, // s_cbranch_scc1 -> header
+            0xBEFE_0309, // s_mov_b32 exec_lo, s9
+        ];
+        words.extend(EXP_NULL_DONE);
+        words.push(S_ENDPGM);
+        let p = build(&words, false);
+        let s = structure(&p).unwrap();
+        assert!(s.discards.is_empty(), "{:?}", s.discards);
+        // The back edge is taken by the lanes not done, not by every lane.
+        let back = p
+            .blocks
+            .iter()
+            .position(|b| b.insts.last().is_some_and(|i| i.name() == "s_cbranch_scc1"))
+            .unwrap();
+        let LaneExit::Branch { when, .. } = s.exits[back] else {
+            panic!("{:?}", s.exits)
+        };
+        assert_ne!(when, Bool::TRUE);
+    }
+
+    /// The same test on a forward branch to a null export is a discard.
+    #[test]
+    fn a_forward_exit_to_a_null_export_is_a_discard() {
+        let mut words = vec![
+            0xBE88_037E, // s_mov_b32 s8, exec_lo
+            0x7C22_0080, // v_cmpx_lt_f32 exec, 0, v0 (the lanes killed)
+            0x8A08_7E08, // s_andn2_b32 s8, s8, exec_lo
+            0xBF84_0005, // s_cbranch_scc0 -> kill
+            0xBEFE_0308, // s_mov_b32 exec_lo, s8
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xF800_180F,
+            0x0101_0101, // exp mrt0, v1, v1, v1, v1 done vm
+            S_ENDPGM,
+        ];
+        words.extend(EXP_NULL_DONE); // kill:
+        words.push(S_ENDPGM);
+        let s = structure(&build(&words, false)).unwrap();
+        assert_eq!(s.discards.len(), 1, "{:?}", s.discards);
     }
 
     #[test]
