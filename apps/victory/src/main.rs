@@ -148,6 +148,9 @@ enum Console {
 
 fn main() -> Result<()> {
     victory_core::logging::init("info");
+    // Our windows go to the interactive desktop even when started elsewhere.
+    #[cfg(windows)]
+    victory_gpu::desktop::attach();
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {

@@ -124,6 +124,7 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
+    victory_gpu::desktop::attach();
     let top = parent.is_null();
     // SAFETY: the title's own arguments, forwarded (a top-level window
     // made message-only).
@@ -165,6 +166,7 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
+    victory_gpu::desktop::attach();
     let top = parent.is_null();
     // SAFETY: the title's own arguments, forwarded (a top-level window
     // made message-only).
@@ -290,6 +292,7 @@ fn stand_in(title: HWND, ex_style: u32, style: u32, x: i32, y: i32, width: i32, 
     let spawned = std::thread::Builder::new()
         .name("victory-window".into())
         .spawn(move || {
+            victory_gpu::desktop::attach();
             let window = make_stand_in(&text, ex_style, style, (x, y, width, height), icon);
             let _ = sender.send(window as usize);
             if !window.is_null() {

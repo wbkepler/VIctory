@@ -3771,6 +3771,7 @@ fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     std::thread::Builder::new()
         .name("victory-window".into())
         .spawn(move || {
+            crate::desktop::attach();
             let made = make_window(width, height);
             let ok = made.is_ok();
             let _ = sender.send(made.map(|h| h.0 as usize));

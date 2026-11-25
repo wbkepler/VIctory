@@ -24,6 +24,8 @@ pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
+#[cfg(windows)]
+pub mod desktop;
 pub mod device;
 #[cfg(windows)]
 mod draw;
