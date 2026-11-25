@@ -1520,6 +1520,64 @@ pub(crate) fn all() -> Vec<Arc<Shadow>> {
     all
 }
 
+/// What is known of title address `address`, for the warning of a draw
+/// dropped over it: the title buffers starting nearest at or below it (and
+/// whether they hold it and have a copy), the window of loose memory there,
+/// and what the system says of its page.
+pub(crate) fn about(address: u64) -> String {
+    use std::fmt::Write;
+    let mut text = String::new();
+    {
+        let map = buffers();
+        let below: Vec<String> = map
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(3)
+            .map(|(k, e)| {
+                format!(
+                    "{:#x}+{:#x}{}{}",
+                    k.0,
+                    e.end - k.0,
+                    if e.end > address { " holds it" } else { "" },
+                    if e.shadow.is_some() { ", copied" } else { "" }
+                )
+            })
+            .collect();
+        let _ = write!(text, "{} title buffers, nearest below {below:?}", map.len());
+    }
+    let window = address & !(WINDOW - 1);
+    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let windows: Vec<String> = loose
+        .range((window, 0)..(window.saturating_add(1), 0))
+        .map(|(k, _)| format!("{:#x}+{:#x}", k.0, k.1))
+        .collect();
+    let _ = write!(text, "; {} loose windows, there {windows:?}", loose.len());
+    drop(loose);
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size; any address may be asked about.
+        let n = unsafe { VirtualQuery(address as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            text.push_str("; no such address");
+        } else {
+            let _ = write!(
+                text,
+                "; page state {:#x} protect {:#x} type {:#x}, region {:#x}+{:#x} of allocation {:#x}",
+                info.State,
+                info.Protect,
+                info.Type,
+                info.BaseAddress as usize,
+                info.RegionSize,
+                info.AllocationBase as usize
+            );
+        }
+    }
+    text
+}
+
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {

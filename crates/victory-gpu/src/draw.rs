@@ -177,6 +177,44 @@ fn not_run(why: &'static str) {
     let _ = why;
 }
 
+/// A draw or dispatch is dropped for want of the view of the root SRV or
+/// UAV (`uav`) at root parameter `slot`: counted by `why` (diagnostics),
+/// and logged now and then with what is known of the root address.
+fn no_root_view(why: &'static str, slot: u8, uav: bool, address: Option<u64>) {
+    not_run(why);
+    static DROPPED_VIEWS: AtomicU64 = AtomicU64::new(0);
+    let n = DROPPED_VIEWS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        tracing::warn!(
+            dropped = n,
+            slot,
+            kind = if uav { "UAV" } else { "SRV" },
+            address = format_args!("{:#x?}", address),
+            memory = %address.map(crate::shadow::about).unwrap_or_default(),
+            "a draw or dispatch dropped: {why}"
+        );
+    }
+}
+
+/// The host copy holding the root address the title set (`address`, if it
+/// set one), that address and its byte offset in the copy, or why a shader
+/// cannot be given its root view.
+#[allow(clippy::type_complexity)]
+fn root_view_offset(
+    address: Option<u64>,
+) -> Result<(std::sync::Arc<crate::shadow::Shadow>, u64, u32), &'static str> {
+    let Some(address) = address else {
+        return Err("a root view the title did not set");
+    };
+    let Some(shadow) = crate::shadow::find(address, 1) else {
+        return Err("no host copy at its root view's address");
+    };
+    match u32::try_from(shadow.offset(address)) {
+        Ok(offset) => Ok((shadow, address, offset)),
+        Err(_) => Err("its root view lies past 4 GiB of its host copy"),
+    }
+}
+
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
@@ -514,6 +552,15 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        if compute
+            && p.stages
+                .iter()
+                .any(|s| s.memory.is_some() && reads_fifth_constant(&s.translated().host.user_data))
+        {
+            once!("a title-memory compute program reading a fifth root constant: dropped, as before");
+            not_run("title-memory compute reading a fifth root constant");
+            return false;
+        }
         let l = &list.list;
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
@@ -652,16 +699,20 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
-                        None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
+                        None if is_root_view_offset(u) => {
                             // Where the root address lies in the copy its view shows.
-                            let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
-                                Some(&Root::View(address)) => crate::shadow::find(address, 1)
-                                    .and_then(|s| u32::try_from(s.offset(address)).ok()),
-                                _ => None,
-                            };
-                            match offset {
-                                Some(offset) => offset,
-                                None => return false,
+                            let address = self.root_address(compute, u.slot);
+                            match root_view_offset(address) {
+                                Ok((_, _, offset)) => offset,
+                                Err(why) => {
+                                    let uav = t.used.iter().any(|r| {
+                                        r.slot == u.slot
+                                            && r.root == RootType::Descriptor
+                                            && r.kind == ResourceType::Uav
+                                    });
+                                    no_root_view(why, u.slot, uav, address);
+                                    return false;
+                                }
                             }
                         }
                         None if is_root_view(u) => {
@@ -805,12 +856,34 @@ impl State {
     /// shortcut: what shaders write through a root UAV goes back to title
     /// memory for 1 MiB from its address, as before the views.
     fn root_view(&mut self, list: &HostList, compute: bool, slot: u8, uav: bool) -> Option<(u32, u32)> {
-        let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
-            once!(slot, "a shader reads a root view the title did not set: dropped");
-            return None;
-        };
-        let shadow = crate::shadow::find(address, 1)?;
-        let offset = u32::try_from(shadow.offset(address)).ok()?;
+        let address = self.root_address(compute, slot);
+        match self.root_view_at(list, address, uav) {
+            Ok(view) => Some(view),
+            Err(why) => {
+                no_root_view(why, slot, uav, address);
+                None
+            }
+        }
+    }
+
+    /// The root address the title set at root parameter `slot`, if it set
+    /// a root view there.
+    fn root_address(&self, compute: bool, slot: u8) -> Option<u64> {
+        match self.roots_ref(compute).get(usize::from(slot)) {
+            Some(&Root::View(address)) => Some(address),
+            _ => None,
+        }
+    }
+
+    /// [`State::root_view`] for the root address the title set (if it set
+    /// one), or why there is no view.
+    fn root_view_at(
+        &mut self,
+        list: &HostList,
+        address: Option<u64>,
+        uav: bool,
+    ) -> Result<(u32, u32), &'static str> {
+        let (shadow, address, offset) = root_view_offset(address)?;
         shadow.refresh(list, address, shadow.left(address));
         if uav {
             // Writes through the view are marked wherever they land in the
@@ -818,22 +891,23 @@ impl State {
             let len = if shadow.marked() { shadow.left(address) } else { shadow.left(address).min(1 << 20) };
             shadow.gpu_writes(list, address, len, true);
         }
-        let (key, host) = match self.heaps[0] {
-            0 => (MEMORY_HEAP, crate::memory::heap()?),
-            h => (
-                std::ptr::from_ref(crate::descriptor::heap(h as This)) as usize,
-                crate::descriptor::heap(h as This).host()?,
-            ),
+        let host = match self.heaps[0] {
+            0 => crate::memory::heap().map(|h| (MEMORY_HEAP, h)),
+            h => crate::descriptor::heap(h as This)
+                .host()
+                .map(|host| (std::ptr::from_ref(crate::descriptor::heap(h as This)) as usize, host)),
+        };
+        let Some((key, host)) = host else {
+            return Err("no host view heap for its root view");
         };
         let copy = std::sync::Arc::as_ptr(&shadow) as usize;
         if let Some(&index) = self.root_slots.get(&(key, copy, uav)) {
-            return Some((index, offset));
+            return Ok((index, offset));
         }
         let (run_heap, next, end) = self.root_run;
         if run_heap != key || next >= end {
             let Some(first) = host.dynamic(ROOT_VIEW_RUN) else {
-                once!("no dynamic slots for root views: dropped");
-                return None;
+                return Err("no dynamic slots for its root view");
             };
             self.dynamic.push((key, first, ROOT_VIEW_RUN));
             self.root_run = (key, first, first + ROOT_VIEW_RUN);
@@ -846,7 +920,7 @@ impl State {
             host.set_mark(index, shadow.mark_entry(shadow.range().0));
         }
         self.root_slots.insert((key, copy, uav), index);
-        Some((index, offset))
+        Ok((index, offset))
     }
 
     /// Gives the host list the title's heaps if it has others.
@@ -1912,6 +1986,26 @@ fn is_root_view(u: &victory_shader::emit::UserData) -> bool {
     u.root == RootType::Descriptor && u.dword >= victory_shader::emit::ROOT_SRV_VIEW
 }
 
+/// A user-data entry that takes a root view's byte offset in its view. A
+/// root descriptor's alone: dword 4 of root constants is a constant (taken
+/// for an offset, every dispatch reading a fifth root constant was dropped:
+/// its slot holds no root view).
+fn is_root_view_offset(u: &victory_shader::emit::UserData) -> bool {
+    u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_VIEW_OFFSET
+}
+
+/// Whether a shader's user data takes the fifth dword of a root-constants
+/// parameter. Compute programs doing so in title memory (the console
+/// ray-tracing library's BVH build kernels) stay dropped as when that dword
+/// was taken for a root view's offset: run, they leave a later refit
+/// dispatch of the same library climbing without end (device hung at world
+/// load).
+fn reads_fifth_constant(user_data: &[victory_shader::emit::UserData]) -> bool {
+    user_data
+        .iter()
+        .any(|u| u.root == RootType::Constants && u.dword == victory_shader::emit::ROOT_VIEW_OFFSET)
+}
+
 /// Whether a shader reads root views through views the host makes.
 fn has_root_views(t: &victory_shader::emit::HostShader) -> bool {
     t.user_data.iter().any(is_root_view)
@@ -2255,6 +2349,34 @@ uint ps() : SV_Target { return 1; }
             host.execute(&[&list]);
             assert_eq!(out.read_host(dst_bytes as u64, 16), want, "round {round}");
         }
+    }
+
+    /// Root constants have a dword 4 too: only a root descriptor's entry
+    /// with that mark takes its view's offset (or heap index). Taken for
+    /// one, a compute program reading its fifth root constant had every
+    /// dispatch dropped, its constants' slot holding no root view.
+    #[test]
+    fn root_constants_are_not_root_views() {
+        use victory_shader::emit::{ROOT_SRV_VIEW, ROOT_UAV_VIEW, ROOT_VIEW_OFFSET, UserData};
+        let entry = |root, dword| UserData { index: 0, slot: 2, root, dword };
+        for dword in [ROOT_SRV_VIEW, ROOT_UAV_VIEW, ROOT_VIEW_OFFSET] {
+            for root in [RootType::Constants, RootType::Table] {
+                assert!(!is_root_view_offset(&entry(root, dword)), "{root:?} dword {dword}");
+                assert!(!is_root_view(&entry(root, dword)), "{root:?} dword {dword}");
+            }
+            let u = entry(RootType::Descriptor, dword);
+            assert_eq!(is_root_view_offset(&u), dword == ROOT_VIEW_OFFSET);
+            assert!(is_root_view(&u));
+        }
+        assert!(reads_fifth_constant(&[entry(RootType::Constants, ROOT_VIEW_OFFSET)]));
+        assert!(!reads_fifth_constant(&[entry(RootType::Descriptor, ROOT_VIEW_OFFSET)]));
+        assert!(!reads_fifth_constant(&[entry(RootType::Constants, 3)]));
+        // The fifth constant of a slot the title set constants at.
+        let mut state = State::default();
+        state.set_constants(true, 2, &[10, 11, 12, 13, 14, 15], 0);
+        assert_eq!(state.user_value(true, 2, RootType::Constants, ROOT_VIEW_OFFSET), 14);
+        assert_eq!(state.root_address(true, 2), None);
+        assert_eq!(root_view_offset(None).err(), Some("a root view the title did not set"));
     }
 
     /// Title memory of `bytes` (64 KiB aligned) for textures at an address.
