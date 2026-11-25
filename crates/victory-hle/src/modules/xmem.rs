@@ -523,6 +523,13 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 /// them with `<< 4` (128 GiB of pages at most).
 const FRAMES: usize = PAGE >> 12;
 
+/// How many of `pages` are no allocated page (diagnostics: a DirectStorage
+/// destination that could not be written).
+pub(crate) fn unknown_pages(pages: &[usize]) -> usize {
+    let physical = physical();
+    pages.iter().filter(|p| !physical.pages.contains_key(p)).count()
+}
+
 /// Pages still mapped stay readable through their views until unmapped.
 pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
     if pages.is_null() {
