@@ -1293,3 +1293,53 @@ fn nested_exec_masks_keep_shared_visibility_results_across_halves() {
         }
     }
 }
+
+/// Multi-wave group (128 threads = 2 console wave64s) sharing LDS across an
+/// `s_barrier` and reading across the 32-lane halves of each wave with
+/// `v_readlane_b32` in straight-line control flow: each wave's `exchange`
+/// uses its own slots (`2 * wave_idx + half`) and both waves meet at
+/// `s_barrier`.
+#[test]
+fn multi_wave_group_with_lds_barrier_and_readlane_keeps_waves_isolated() {
+    let body = [
+        // Write (lane + 10) to LDS[lane * 4].
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0x4A0A_008A, // v_add_nc_u32 v5, 10, v0
+        0xD834_0000,
+        0x0000_0504, // ds_write_b32 v4, v5
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        // Read LDS from the opposite console wave: (lane ^ 64) * 4.
+        0x3A0C_00FF,
+        64, // v_xor_b32 v6, 64, v0
+        0x340C_0C82, // v_lshlrev_b32 v6, 2, v6
+        0xD8D8_0000,
+        0x0700_0006, // ds_read_b32 v7, v6
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        // Read console lane 35 (in the upper half of each wave64) via exchange.
+        0xD760_0009,
+        0x0001_4707, // v_readlane_b32 s9, v7, 35
+        // Output: (v7 << 8) | s9.
+        0x340E_0E88, // v_lshlrev_b32 v7, 8, v7
+        0x4A04_0E09, // v_add_nc_u32 v2, s9, v7
+    ];
+    let p = program_lds(&body, 128);
+    let Ok(mut names) = adapters() else { return };
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        let Ok(host) = Host::on(&name) else { continue };
+        if !host.target().runs(32) && !host.target().runs(64) {
+            continue;
+        }
+        let values = run(&host, &p, 2).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(values.len(), 256);
+        for (i, &got) in values.iter().enumerate() {
+            let local = (i as u32) % 128;
+            let other = local ^ 64;
+            let wave_other_35 = ((local & !63) | 35) ^ 64;
+            let want = ((other + 10) << 8) | (wave_other_35 + 10);
+            assert_eq!(got, want, "{name}: thread {i}");
+        }
+    }
+}

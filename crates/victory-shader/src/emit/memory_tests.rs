@@ -628,3 +628,230 @@ fn writes_through_views_mark_their_pages() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// Cross-threadgroup lock-free handoff through a root UAV in a title-memory
+/// program: `buffer_store_dword ... glc`, `s_waitcnt_vscnt null, 0`,
+/// `buffer_atomic_add ... glc`, and `buffer_load_dword ... glc dlc`.
+/// Verifies that title-memory UAV loads bind the UAV view (not the read-only
+/// SRV), set `IsGloballyCoherent`, and emit `dx.op.barrier(2)` for
+/// `s_waitcnt_vscnt null, 0`.
+#[test]
+fn root_uav_title_memory_coherence_across_groups() {
+    const fn vop2(op: u32, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+        op << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | src0 as u32
+    }
+    const fn sop2(op: u32, sdst: u8, src0: u8, src1: u8) -> u32 {
+        0x8000_0000 | op << 23 | (sdst as u32) << 16 | (src1 as u32) << 8 | src0 as u32
+    }
+    const fn vopc(op: u32, src0: u16, vsrc1: u8) -> u32 {
+        0x7C00_0000 | op << 17 | (vsrc1 as u32) << 9 | src0 as u32
+    }
+    /// MUBUF `op` (offen, optional glc/dlc) of `vdata` at `vaddr` through `s[srsrc:srsrc+3]`.
+    const fn mubuf(op: u32, vdata: u8, vaddr: u8, srsrc: u8, glc: bool, dlc: bool) -> [u32; 2] {
+        let flags = 1 << 12 | (glc as u32) << 14 | (dlc as u32) << 15;
+        [
+            0x38 << 26 | op << 18 | flags,
+            0x80 << 24 | ((srsrc as u32) >> 2) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
+    }
+    const S_WAITCNT_VSCNT_0: u32 = 0xBBFD_0000;
+    const S_WAITCNT_VMCNT_0: u32 = 0xBF8C_3F70;
+    const S_LSHL_B32: u32 = 0x1E;
+    const V_LSHLREV_B32: u32 = 0x1A;
+    const V_AND_B32: u32 = 0x1B;
+    const V_XOR_B32: u32 = 0x1D;
+    const V_ADD_NC_U32: u32 = 0x25;
+    const V_CMPX_NE_U32: u32 = 0xD5;
+    const LIT: u16 = 255;
+
+    let mut w = vec![
+        s_mov_b32(7, ZERO as u8), // s[6:7]: table at s6
+    ];
+    w.extend(s_load(2, 12, 6, 0)); // s[12:15]: output UAV
+    w.extend(s_load(0, 10, 0, 0)); // s10: trigger title-memory mode via pointer in s[0:1]
+    // Build raw buffer descriptor s[16:19] around root UAV s[4:5].
+    w.extend([
+        s_mov_b32(16, 4),
+        0x8811_FF05,
+        0x0001_0000, // s_or_b32 s17, s5, stride 1
+        0xBE92_03C1, // s_mov_b32 s18, -1
+        0xBE93_03FF,
+        0x1101_4FAC, // s_mov_b32 s19, buffer word 3
+    ]);
+    w.push(S_WAITCNT_ALL);
+    // Global thread id t = tgid_x * 32 + tid_x (tgid_x in s8, tid_x in v0).
+    w.push(sop2(S_LSHL_B32, 9, 8, 128 + 5)); // s9 = s8 << 5
+    w.push(vop2(V_ADD_NC_U32, 1, 9, 0)); // v1 = t
+    w.push(vop2(V_LSHLREV_B32, 2, 128 + 2, 1)); // v2 = t * 4
+    w.extend([vop2(V_ADD_NC_U32, 3, LIT, 1), 0x100]); // v3 = t + 0x100
+    w.extend(mubuf(0x1C, 3, 2, 16, true, false)); // buffer_store_dword payload[t] glc
+    w.push(S_WAITCNT_VSCNT_0); // DeviceMemoryBarrier before atomic signal
+    w.extend([vop2(V_AND_B32, 4, LIT, 1), 0x3FF]); // v4 = k = t & 1023
+    w.push(vop2(V_LSHLREV_B32, 5, 128 + 2, 4)); // v5 = k * 4
+    w.extend([vop2(V_ADD_NC_U32, 6, LIT, 5), 0x2000]); // v6 = 0x2000 + k * 4
+    w.push(v_mov_b32(7, 129)); // v7 = 1
+    w.extend(mubuf(0x32, 7, 6, 16, true, false)); // buffer_atomic_add counter[k] glc
+    w.push(S_WAITCNT_VMCNT_0);
+    w.push(vopc(V_CMPX_NE_U32, ZERO, 7)); // only the second thread of each pair continues
+    w.extend([vop2(V_XOR_B32, 8, LIT, 1), 1024]); // v8 = t ^ 1024 (sibling in another group)
+    w.push(vop2(V_LSHLREV_B32, 8, 128 + 2, 8)); // v8 = (t ^ 1024) * 4
+    w.extend(mubuf(0x0C, 9, 8, 16, true, true)); // buffer_load_dword payload[sibling] glc dlc
+    w.push(S_WAITCNT_VMCNT_0);
+    w.push(vop2(V_ADD_NC_U32, 9, 256 + 3, 9)); // v9 = payload[t] + payload[sibling]
+    w.extend(mubuf(0x1C, 9, 5, 12, false, false)); // out[k] = v9
+    w.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 10,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 6,
+                slot: 2,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 1,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 6,
+                slot: 2,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 8 << 1 | 1 << 7,
+            threads: [32, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
+        gs: None,
+    })
+    .expect("lower");
+    assert!(
+        super::shader::last_summary().contains("barrier"),
+        "s_waitcnt_vscnt null, 0 must emit dx.op.barrier: {}",
+        super::shader::last_summary()
+    );
+    assert!(l.memory && l.memory_writes);
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
+        regroup: l.regroup,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let memory = vec![0u32; 3072];
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                RootType::Constants | RootType::Descriptor => (TITLE >> (32 * u.dword)) as u32,
+                _ => 0,
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: page_table(1, 3) }),
+                        (2, Root::Uav(2 * 4096 / 32)),
+                    ],
+                    views: &[
+                        View::RawUav(1024),
+                        View::Memory(&memory),
+                        View::Pair,
+                        View::NullPair,
+                        View::Pair,
+                    ],
+                    samplers: &[],
+                    groups: [64, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let want: Vec<u32> = (0..1024u32)
+            .map(|k| (k + 0x100) + ((k ^ 1024) + 0x100))
+            .collect();
+        assert_eq!(out[0], want, "{label}: cross-group handoff via globally coherent root UAV");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
