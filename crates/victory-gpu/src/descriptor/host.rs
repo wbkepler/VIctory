@@ -1054,8 +1054,7 @@ impl HostHeap {
 
     /// Makes title slots `first..last` from safely copied title bytes `bytes`
     /// (`for_draw = false`), locking `self.made` once and `VIEWS` at most once
-    /// while applying changed slots directly under `VIEWS` (zero `View::clone`
-    /// and no stale-`Resource*` window against concurrent `Drop for Resource`).
+    /// (cloning only the views of changed slots).
     /// Slots are keyed as `mirror` does: by title index through the block
     /// map, so an unchanged slot is skipped by what its host slot holds now.
     pub(crate) fn mirror_bytes(&self, first: u32, last: u32, step: u64, bytes: &[u8]) {
@@ -1064,6 +1063,10 @@ impl HostHeap {
             return;
         }
         let mut guard = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        // The changed slots are found under `VIEWS` (cloning only those)
+        // and made after it is released: making a view calls back into
+        // code that takes `VIEWS` itself (std mutexes do not re-enter).
+        let mut changed = Vec::new();
         scan_bytes(
             &mut guard[..],
             first,
@@ -1071,10 +1074,11 @@ impl HostHeap {
             step,
             bytes,
             |made, index| self.prior(made, index),
-            |made, index, key, view| {
-                self.set_slot(made, index, key, view, false);
-            },
+            |_, index, key, view| changed.push((index, key, view.cloned())),
         );
+        for (index, key, view) in changed {
+            self.set_slot(&mut guard, index, key, view.as_ref(), false);
+        }
     }
 
     /// The view host slot `index` was made from, in a few words, with the
