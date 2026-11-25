@@ -2189,4 +2189,18 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn direct_barycentrics_read_translates_and_validates() {
+        // Pixel shader that writes raw perspective-center barycentrics (I, J) to mrt0.
+        let words = [
+            0xF800_180Fu32,
+            0x0101_0000, // exp mrt0, v0, v0, v1, v1 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let isg1 = rows(&[("SV_Position", 3, false)], true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        // SPI_PS_INPUT_ADDR bit 1 = persp_center_ena (2 barycentric VGPRs v0, v1).
+        emit_pixel(&words, vec![], 1 << 1, &isg1, &osg1).expect("direct barycentrics validate");
+    }
 }

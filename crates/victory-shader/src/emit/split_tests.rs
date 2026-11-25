@@ -714,8 +714,9 @@ fn masked_whole_wave_sum_straddles_the_halves() {
     });
 }
 
-/// A whole-wave section crosses the halves only in a group of exactly one
-/// console wave: with a partial upper half, or none, it still stops.
+/// A whole-wave section crosses the halves in a single-wave 64-thread group,
+/// or runs directly in one 32-lane wave when the group has at most 32 threads;
+/// partial upper-half groups such as 48 threads remain refused.
 #[test]
 fn whole_wave_sections_in_partial_groups_still_stop() {
     let nvidia = super::Target {
@@ -725,15 +726,35 @@ fn whole_wave_sections_in_partial_groups_still_stop() {
     let mut body = reduction_scan(37, 0x80);
     body.push(0x7E04_020A); // v_mov_b32 v2, s10
     assert!(emit_for(&program(&body, 64), nvidia).is_ok());
-    for threads in [48, 32] {
-        assert_eq!(
-            emit_for(&program(&body, threads), nvidia),
-            Err(crate::ShaderError::Unsupported {
-                offset: 0,
-                what: "a whole-wave section of a wave64 on a host without 64-lane waves",
-            }),
-            "{threads} threads"
-        );
+    assert!(emit_for(&program(&body, 32), nvidia).is_ok(), "32 threads fit in one host wave");
+    assert_eq!(
+        emit_for(&program(&body, 48), nvidia),
+        Err(crate::ShaderError::Unsupported {
+            offset: 0,
+            what: "a whole-wave section of a wave64 on a host without 64-lane waves",
+        }),
+        "48 threads"
+    );
+}
+
+#[test]
+fn small_wave64_group_runs_whole_wave_min_reduction_on_gpu() {
+    // 32-thread wave64 program running whole-wave min reduction (v_min_u32
+    // opcode 19, identity -1 = 0xC1) over v0 = 0..31: min is 0, without
+    // a fake upper half corrupting the identity.
+    let mut body = reduction_scan(19, 0xC1); // v_min_u32 -> s10
+    body.push(0x7E04_020A); // v_mov_b32 v2, s10
+    let p = program(&body, 32);
+    let Ok(mut names) = adapters() else { return };
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        let Ok(host) = Host::on(&name) else { continue };
+        if !host.target().runs(32) && !host.target().runs(64) {
+            continue;
+        }
+        let values = run(&host, &p, 1).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(values, vec![0u32; 32], "{name}");
     }
 }
 

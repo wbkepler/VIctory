@@ -15,6 +15,7 @@ enum TypeDef {
     Void,
     Int(u32),
     Float,
+    Double,
     /// Pointee and address space.
     Ptr(Ty, u32),
     Struct(Option<String>, Vec<Ty>),
@@ -47,6 +48,7 @@ struct Global {
 enum Const {
     Int(i64),
     Float(u32),
+    Double(u64),
     Undef,
     Aggregate(Vec<u32>),
 }
@@ -92,6 +94,8 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
+    FpTrunc = 7,
+    FpExt = 8,
     Bitcast = 11,
 }
 
@@ -233,6 +237,9 @@ impl Module {
     pub fn float(&mut self) -> Ty {
         self.ty(TypeDef::Float)
     }
+    pub fn double(&mut self) -> Ty {
+        self.ty(TypeDef::Double)
+    }
     pub fn ptr(&mut self, to: Ty) -> Ty {
         self.ty(TypeDef::Ptr(to, 0))
     }
@@ -281,6 +288,10 @@ impl Module {
     pub fn f32(&mut self, bits: u32) -> V {
         let t = self.float();
         self.constant(t, Const::Float(bits))
+    }
+    pub fn f64(&mut self, bits: u64) -> V {
+        let t = self.double();
+        self.constant(t, Const::Double(bits))
     }
     pub fn undef(&mut self, ty: Ty) -> V {
         self.constant(ty, Const::Undef)
@@ -561,6 +572,7 @@ impl Module {
             match t {
                 TypeDef::Void => w.record(2, &[]),
                 TypeDef::Float => w.record(3, &[]),
+                TypeDef::Double => w.record(4, &[]),
                 TypeDef::Int(b) => w.record(7, &[u64::from(*b)]),
                 TypeDef::Ptr(p, space) => w.record(8, &[u64::from(p.0), u64::from(*space)]),
                 TypeDef::Array(n, e) => w.record(11, &[u64::from(*n), u64::from(e.0)]),
@@ -652,6 +664,7 @@ impl Module {
                 Const::Undef => w.record(3, &[]),
                 Const::Int(v) => w.record(4, &[signed(*v)]),
                 Const::Float(bits) => w.record(6, &[u64::from(*bits)]),
+                Const::Double(bits) => w.record(6, &[*bits]),
                 Const::Aggregate(ids) => {
                     let r: Vec<u64> = ids.iter().map(|&i| const_id(i)).collect();
                     w.record(7, &r);

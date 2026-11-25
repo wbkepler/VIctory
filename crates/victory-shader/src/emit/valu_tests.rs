@@ -1757,3 +1757,159 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+#[test]
+fn permlanex16_and_f64_arithmetic_match_reference() {
+    let perm_p = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 8 << 1,
+            threads: [32, 1, 1],
+        }),
+        code: [
+            0xBE81_0380u32, // s_mov_b32 s1, 0
+            0xF408_0100,
+            0xFA00_0000, // s_load_dwordx4 s[4:7], s[0:1], 0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x4A02_008A, // v_add_nc_u32 v1, 10, v0
+            0xD778_0002,
+            0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0  (reads lane (lane ^ 16) & ~15)
+            0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+            0xE070_1000,
+            0x8001_0203, // buffer_store_dword v2, v3, s[4:7], 0 offen
+            0xBF81_0000, // s_endpgm
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect(),
+    };
+    let p_ir = ir::build(&perm_p.code, perm_p.wave64, perm_p.vgprs).expect("ir");
+    let st = structure::structure(&p_ir).expect("st");
+    let res = resource::track(&p_ir, &perm_p.layout, perm_p.stage, Some(&st)).expect("res");
+    let io_p = io::raise(&p_ir, &perm_p).expect("io");
+    let low = super::lower::lower(&super::lower::Parts {
+        native: &perm_p,
+        p: &p_ir,
+        st: &st,
+        io: &io_p,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
+        gs: None,
+    })
+    .expect("lower");
+    let perm_shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: low.dxil,
+        user_data: low.user_data,
+        samplers: low.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: low.root_cbvs,
+        root_srvs: low.root_srvs,
+        root_uavs: low.root_uavs,
+        memory: low.memory,
+        memory_writes: low.memory_writes,
+        view_addresses: low.view_addresses,
+        heap: low.heap,
+        heap_writes: low.heap_writes,
+        view_marks: low.view_marks,
+        regroup: low.regroup,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut perm_shader.dxil.clone()).expect("DXIL validation failed");
+    }
+
+    // f64 arithmetic + conversions: f64(s0 as f32) + f64(s1 as i32) * 2.0 -> f32.
+    let f64_shader = build_valu_cs(&[
+        vop1(0x010, 2, sgpr(0)),        // v_cvt_f64_f32 v[2:3], s0
+        vop1(0x004, 4, sgpr(1)),        // v_cvt_f64_i32 v[4:5], s1
+        0xD564_0002,
+        0x0002_0504,                    // v_add_f64 v[2:3], v[4:5], v[2:3]
+        0xD565_0002,
+        0x0001_E902,                    // v_mul_f64 v[2:3], v[2:3], 2.0 (inline const 244)
+        vop1(0x00F, 0, vgpr(2)),        // v_cvt_f32_f64 v0, v[2:3]
+    ]);
+    {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ran = 0;
+        let mut perm_ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else { continue };
+            if host.target().runs(32) {
+                let (pr, pp) = host.compute_pipeline(&perm_shader).expect("perm pso");
+                let mut pud = vec![0u32; perm_shader.user_data_dwords().max(1) as usize];
+                pud[0] = 0;
+                let pout = host
+                    .dispatch(
+                        &pr,
+                        &pp,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(pud))],
+                            views: &[View::RawUav(32)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                let want_perm: Vec<u32> = (0..32u32).map(|l| ((l & !15) ^ 16) + 10).collect();
+                assert_eq!(pout[0], want_perm, "{label}: v_permlanex16_b32");
+                perm_ran += 1;
+            }
+
+            let (fr, fp) = host.compute_pipeline(&f64_shader).expect("f64 pso");
+            for &(a, b) in &[(1.25f32, -3i32), (1e10f32, 7i32)] {
+                let mut fud = vec![0u32; f64_shader.user_data_dwords().max(1) as usize];
+                for u in &f64_shader.user_data {
+                    fud[u.index as usize] = match (u.root, u.dword) {
+                        (RootType::Constants, 0) => a.to_bits(),
+                        (RootType::Constants, 1) => b as u32,
+                        _ => 0,
+                    };
+                }
+                let fout = host
+                    .dispatch(
+                        &fr,
+                        &fp,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(fud))],
+                            views: &[View::RawUav(1)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                let want = ((f64::from(a) + f64::from(b)) * 2.0) as f32;
+                assert_eq!(fout[0][0], want.to_bits(), "{label}: f64 ({a}, {b})");
+            }
+            ran += 1;
+        }
+        assert!(ran > 0, "no SM 6.6 device");
+        assert!(perm_ran > 0, "no wave32 SM 6.6 device");
+    }
+}

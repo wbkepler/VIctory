@@ -23,6 +23,7 @@ use crate::resource::{Address, CODE, GS_TABLE, MEMORY, Resources, Role, Site, So
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod f64;
 
 type Why = &'static str;
 
@@ -248,6 +249,7 @@ struct Lower<'a> {
     data_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
     params: HashMap<Value, (usize, u32)>,
+    barycentrics: HashMap<Value, (Barycentric, u8)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     /// Handles of root SRVs and UAVs read as bounded views, by user-data
@@ -726,6 +728,7 @@ impl<'a> Lower<'a> {
             let in_half = |i: &Inst| {
                 i.name().starts_with("ds_swizzle")
                     || i.name() == "ds_bpermute_b32"
+                    || matches!(i.name(), "v_permlanex16_b32" | "v_permlane16_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             };
             let whole = |i: &Inst| {
@@ -834,7 +837,9 @@ impl<'a> Lower<'a> {
                     .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
                 {
                     Some("ds_permute across the halves of a wave64 on a host without 64-lane waves")
-                } else if host_threads != 64
+                } else if host_threads > 32
+                    && host_threads != 64
+                    && !multi_wave
                     && !(0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty())
                 {
                     Some("a whole-wave section of a wave64 on a host without 64-lane waves")
@@ -965,6 +970,7 @@ impl<'a> Lower<'a> {
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
+            barycentrics: HashMap::new(),
             user_data: None,
             user_reads: BTreeMap::new(),
             root_views: HashMap::new(),
@@ -1625,7 +1631,8 @@ impl<'a> Lower<'a> {
                 )
             }
         };
-        if self.console_cf && self.split {
+        let threads: u32 = self.s.threads.map_or(0, |t| t.iter().product());
+        if self.console_cf && self.split && threads > 32 {
             // The halves exchange dwords: a float goes as its bits. (The
             // console adds a wave's floats in its own order, the host's
             // wave operations in theirs, and the halves' sums are added
@@ -1879,6 +1886,10 @@ impl<'a> Lower<'a> {
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
                 Reg::V(_) => match io_inputs.get(&v) {
+                    Some(&Input::Barycentric { kind, index }) => {
+                        self.barycentrics.insert(v, (kind, index));
+                        continue;
+                    }
                     Some(&input) => self.input(input),
                     // Registers no one set read as zero (the validator
                     // refuses reads of undef).
@@ -2111,6 +2122,17 @@ impl<'a> Lower<'a> {
             self.vals.insert(v, val);
             return Ok(val);
         }
+        if let Some(&(kind, index)) = self.barycentrics.get(&v) {
+            let val = match self.load_barycentric(kind, index) {
+                Ok(x) => Val::I32(x),
+                Err(w) => Val::Missing(w),
+            };
+            self.vals.insert(v, val);
+            return match val {
+                Val::Missing(w) => Err(w),
+                val => Ok(val),
+            };
+        }
         Err("a value defined after its use")
     }
 
@@ -2119,6 +2141,50 @@ impl<'a> Lower<'a> {
             Val::I32(x) => Ok(x),
             Val::Bit(x) => Ok(self.s.m.cast(self.cur, Cast::ZExt, x, self.s.t.i32)),
             Val::Missing(w) => Err(w),
+        }
+    }
+
+    /// Declares `SV_Barycentrics` (`SemanticKind::Barycentrics = 28`) on demand
+    /// when a pixel shader reads raw barycentrics outside `v_interp_*`.
+    fn load_barycentric(&mut self, kind: Barycentric, index: u8) -> Result<V, Why> {
+        if index >= 2 {
+            return Err("barycentrics read directly");
+        }
+        let interp = match kind {
+            Barycentric::PerspectiveCenter => 2,
+            Barycentric::PerspectiveCentroid => 3,
+            Barycentric::PerspectiveSample => 6,
+            Barycentric::LinearCenter => 4,
+            Barycentric::LinearCentroid => 5,
+            Barycentric::LinearSample => 7,
+            Barycentric::PerspectivePullModel => return Err("pull-model barycentrics"),
+        };
+        self.s.flags |= flags::BARYCENTRICS;
+        let id = match self.s.inputs.iter().position(|e| e.kind == 28) {
+            Some(id) if self.s.inputs[id].interp == interp => id,
+            Some(_) => return Err("barycentrics with two interpolation modes"),
+            None => {
+                self.s.inputs.push(SigElement {
+                    name: "SV_Barycentrics".into(),
+                    index: 0,
+                    kind: 28,
+                    comp: 9,
+                    interp,
+                    row: None,
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        // RDNA2 barycentrics hold (I, J) = weights of vertices 1 and 2;
+        // DXIL SV_Barycentrics holds (1 - I - J, I, J).
+        match self.load_input(id, index + 1) {
+            Val::I32(x) => Ok(x),
+            Val::Missing(w) => Err(w),
+            _ => unreachable!("load_input returns I32 or Missing"),
         }
     }
 
@@ -7186,7 +7252,42 @@ impl<'a> Lower<'a> {
                 let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
+            "v_permlanex16_b32" | "v_permlane16_b32" => {
+                // Stays inside each 32-lane half: lane `l` reads lane
+                // `((l & !15) [^ 16]) | pick`, where `pick` is nibble `l & 15`
+                // of `{src2, src1}`.
+                self.cross_lane(true)?;
+                let (x, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let lane = self.lane_index();
+                let (k15, k8, k7, k2, k0, not15) = (
+                    self.s.m.i32(15),
+                    self.s.m.i32(8),
+                    self.s.m.i32(7),
+                    self.s.m.i32(2),
+                    self.s.m.i32(0),
+                    self.s.m.i32(!15u32),
+                );
+                let row = self.s.m.bin(c, Bin::And, lane, k15);
+                let hi_bit = self.s.m.bin(c, Bin::And, row, k8);
+                let hi = self.s.m.cmp(c, pred::NE, hi_bit, k0);
+                let word = self.s.m.select(c, hi, s2, s1);
+                let lo_row = self.s.m.bin(c, Bin::And, row, k7);
+                let shift = self.s.m.bin(c, Bin::Shl, lo_row, k2);
+                let shifted = self.s.m.bin(c, Bin::LShr, word, shift);
+                let pick = self.s.m.bin(c, Bin::And, shifted, k15);
+                let mut base = self.s.m.bin(c, Bin::And, lane, not15);
+                if name == "v_permlanex16_b32" {
+                    let k16 = self.s.m.i32(16);
+                    base = self.s.m.bin(c, Bin::Xor, base, k16);
+                }
+                let target = self.s.m.bin(c, Bin::Or, base, pick);
+                let r = self.read_lane(x, target);
+                int(self, r)
+            }
             _ => {
+                if let Some(res) = self.valu_f64(inst, name, guard) {
+                    return res;
+                }
                 let r = self.integer(inst, name)?;
                 int(self, r)
             }
