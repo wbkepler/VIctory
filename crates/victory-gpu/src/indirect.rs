@@ -57,7 +57,7 @@ use crate::host::{HostList, host, transition};
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
 #define RS_BATCH "UAV(u0), UAV(u1), SRV(t0)"
-cbuffer Record : register(b0) { uint one_kind; uint one_stride; uint one_records; uint unused; };
+cbuffer Record : register(b0) { uint one_kind; uint one_stride; uint one_records; uint one_regroup; };
 RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
@@ -68,8 +68,10 @@ ByteAddressBuffer jobs : register(t0);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
-// Clamps the record of `kind` at `at` in place; its cost.
-uint clamped(uint kind, uint at) {
+// Clamps the record of `kind` at `at` in place; its cost. A dispatch whose
+// console groups run as `regroup` host groups each has its X multiplied
+// (`ungroup` puts it back after the execution).
+uint clamped(uint kind, uint at, uint regroup) {
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
@@ -79,6 +81,7 @@ uint clamped(uint kind, uint at) {
         args.Store2(at, uint2(count, instances));
     } else if (kind == 2) {
         uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
+        g.x = min(g.x * regroup, 65535u);
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
@@ -101,13 +104,13 @@ groupshared uint costs[64];
 // record, then the first lane charges the tile's records in order. No
 // other group shares the budget: a shared add wraps once enough records
 // are rejected, and a compare-exchange retries more the more records fit.
-void walk(uint lane, uint base, uint kind, uint stride, uint records, inout uint left) {
+void walk(uint lane, uint base, uint kind, uint stride, uint records, uint regroup, inout uint left) {
     for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
         uint record = tile * 64 + lane;
         uint at = base + record * stride;
         uint cost = 0;
         if (record < records) {
-            cost = clamped(kind, at);
+            cost = clamped(kind, at, regroup);
         }
         costs[lane] = cost;
         GroupMemoryBarrierWithGroupSync();
@@ -137,9 +140,19 @@ void main(uint lane : SV_GroupIndex) {
     if (lane == 0) {
         left = BUDGET - min(budget.Load(0), BUDGET);
     }
-    walk(lane, 0, one_kind, one_stride, one_records, left);
+    walk(lane, 0, one_kind, one_stride, one_records, max(one_regroup, 1u), left);
     if (lane == 0) {
         budget.Store(0, BUDGET - left);
+    }
+}
+// After a regrouped dispatch's execution: each record's X as the title
+// wrote it (clamped).
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void ungroup(uint lane : SV_GroupIndex) {
+    for (uint record = lane; record < one_records; record += 64) {
+        uint at = record * one_stride;
+        args.Store(at, args.Load(at) / max(one_regroup, 1u));
     }
 }
 // The same for every job of a batch, in the order their executions run.
@@ -153,7 +166,7 @@ void batch(uint lane : SV_GroupIndex) {
     uint count = jobs.Load(0);
     for (uint job = 0; job < count; job++) {
         uint4 j = jobs.Load4(16 + job * 16);
-        walk(lane, j.x, j.y, j.z, j.w, left);
+        walk(lane, j.x, j.y, j.z, j.w, 1, left);
     }
     if (lane == 0) {
         budget.Store(0, BUDGET - left);
@@ -167,6 +180,8 @@ struct Clamp {
     /// The same for a batch's jobs.
     batch_root: ID3D12RootSignature,
     batch_pso: ID3D12PipelineState,
+    /// Puts back the X of a regrouped dispatch's records (`root`'s layout).
+    ungroup_pso: ID3D12PipelineState,
 }
 
 // SAFETY: D3D12 objects are free-threaded.
@@ -190,7 +205,8 @@ fn clamp() -> Option<&'static Clamp> {
 fn make() -> windows::core::Result<Clamp> {
     let (root, pso) = compile(s!("main"))?;
     let (batch_root, batch_pso) = compile(s!("batch"))?;
-    Ok(Clamp { root, pso, batch_root, batch_pso })
+    let (_, ungroup_pso) = compile(s!("ungroup"))?;
+    Ok(Clamp { root, pso, batch_root, batch_pso, ungroup_pso })
 }
 
 /// The clamp's entry point `entry` as a pipeline, with its root signature.
@@ -337,19 +353,29 @@ pub(crate) enum Bound {
     Joined,
     /// Not at all (`VICTORY_INDIRECT_CLAMP=never`).
     Unclamped,
+    /// By a clamp of their own that multiplied each dispatch's X by
+    /// `regroup` (host groups per console group); [`Bound::done`] puts it
+    /// back. The records are at host address `gpu`.
+    Regrouped { gpu: u64, stride: u32, records: u32, regroup: u32 },
 }
 
 impl Bound {
     /// Whether a clamp was recorded: the list's compute root signature and
     /// pipeline are ours now (callers bind theirs after).
     pub(crate) fn replaced_compute(self) -> bool {
-        matches!(self, Bound::Alone | Bound::First)
+        matches!(self, Bound::Alone | Bound::First | Bound::Regrouped { .. })
     }
 
-    /// After the execution (or instead of it).
+    /// After the execution (or instead of it). After [`Bound::Regrouped`]
+    /// the list's compute root signature and pipeline are ours again.
     pub(crate) fn done(self, list: &HostList, buffer: &ID3D12Resource) {
-        if self == Bound::Alone {
-            done(list, buffer);
+        match self {
+            Bound::Alone => done(list, buffer),
+            Bound::Regrouped { gpu, stride, records, regroup } => {
+                done(list, buffer);
+                ungroup(list, gpu, (stride, records), regroup);
+            }
+            _ => {}
         }
     }
 }
@@ -399,7 +425,9 @@ pub(crate) fn end(list: &HostList) {
 /// `stride` bytes apart, `offset` bytes into `buffer` (whose host address
 /// is `gpu`), title memory from `address` on, and leaves the buffer ready
 /// to be read as arguments. Draws join the list's batch or open one;
-/// `alone` (dispatches) get a clamp of their own. None if the clamp is not
+/// `alone` (dispatches) get a clamp of their own. Dispatches whose console
+/// groups run as `regroup` > 1 host groups each get one in any mode, which
+/// multiplies their X ([`Bound::Regrouped`]). None if the clamp is not
 /// available: the execution must be dropped.
 pub(crate) fn bounded(
     list: &HostList,
@@ -407,7 +435,14 @@ pub(crate) fn bounded(
     at: (u64, u64, u64),
     spec: (u32, u32, u32),
     alone: bool,
+    regroup: u32,
 ) -> Option<Bound> {
+    if regroup > 1 {
+        end(list);
+        let gpu = at.0 + at.1;
+        let (_, stride, records) = spec;
+        return bound(list, buffer, gpu, spec, regroup).then_some(Bound::Regrouped { gpu, stride, records, regroup });
+    }
     bounded_as(mode(), list, buffer, at, spec, alone)
 }
 
@@ -432,7 +467,7 @@ fn bounded_as(
         (Mode::Batch, Some(o)) if !alone => o,
         _ => {
             end(list);
-            return bound(list, buffer, gpu + offset, spec).then_some(Bound::Alone);
+            return bound(list, buffer, gpu + offset, spec, 1).then_some(Bound::Alone);
         }
     };
     let (c, budget) = (clamp()?, list.budget()?);
@@ -513,14 +548,16 @@ fn bounded_as(
 
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
 /// argument numbering) `stride` bytes apart at host address `gpu` in
-/// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
-/// the list's compute root signature and pipeline (callers bind theirs
-/// after). False if the clamp is not available.
+/// `buffer`, and leaves the buffer ready to be read as arguments; dispatches
+/// get their X multiplied by `regroup`. Replaces the list's compute root
+/// signature and pipeline (callers bind theirs after). False if the clamp is
+/// not available.
 fn bound(
     list: &HostList,
     buffer: &ID3D12Resource,
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
+    regroup: u32,
 ) -> bool {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return false;
@@ -529,7 +566,7 @@ fn bound(
         return false;
     }
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
+    let constants = [kind, stride, records, regroup];
     CLAMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     BOUNDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: an open list; our root signature, pipeline and a live buffer
@@ -554,6 +591,29 @@ fn bound(
         ]);
     }
     true
+}
+
+/// After a regrouped dispatch's execution, the buffer back in unordered
+/// access: the X of each of `records` records `stride` bytes apart at host
+/// address `gpu` divided by `regroup` again, before the title's passes
+/// read them. Replaces the list's compute root signature and pipeline.
+fn ungroup(list: &HostList, gpu: u64, (stride, records): (u32, u32), regroup: u32) {
+    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
+        return;
+    };
+    let l = &list.list;
+    let constants = [2, stride, records, regroup];
+    // SAFETY: an open list; our root signature, pipeline and a live buffer
+    // the caller's list holds.
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.ungroup_pso);
+        l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+        l.SetComputeRootUnorderedAccessView(1, gpu);
+        l.SetComputeRootUnorderedAccessView(2, budget);
+        l.Dispatch(records.min(1), 1, 1);
+        l.ResourceBarrier(&[uav_barrier()]);
+    }
 }
 
 /// After the execution: the buffer back to unordered access, where the
@@ -615,7 +675,7 @@ mod tests {
             }
             let gpu = buffer.GetGPUVirtualAddress();
             for _ in 0..calls {
-                assert!(super::bound(&list, &buffer, gpu, spec));
+                assert!(super::bound(&list, &buffer, gpu, spec, 1));
                 super::done(&list, &buffer);
             }
             list.close();
@@ -625,6 +685,42 @@ mod tests {
             }
             let first = |i: usize| data.add(i * per).read_volatile();
             Some((0..records as usize).map(first).collect())
+        }
+    }
+
+    /// A regrouped dispatch's records run with X times the host groups per
+    /// console group (clamped to the host's limit), and get their X back
+    /// after; Y and Z and the record after them stay as written.
+    #[test]
+    fn regrouped_dispatches_multiply_x_and_put_it_back() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let words = [3, 2, 1, 20_000, 1, 1, 7, 7, 7];
+        let (buffer, data) = host.shared_buffer(words.len() as u64 * 4).unwrap();
+        let data = data.cast::<u32>();
+        let spec = (2, 12, 2);
+        // SAFETY: our mapped buffer, written before the lists run and read
+        // after they have; a live buffer.
+        unsafe {
+            for (at, &w) in words.iter().enumerate() {
+                data.add(at).write_volatile(w);
+            }
+            let gpu = buffer.GetGPUVirtualAddress();
+            let read = || (0..words.len()).map(|i| data.add(i).read_volatile()).collect::<Vec<_>>();
+            // As the execution reads them.
+            let list = host.new_list().unwrap();
+            assert!(super::bound(&list, &buffer, gpu, spec, 4));
+            super::done(&list, &buffer);
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(read(), [12, 2, 1, 65_535, 1, 1, 7, 7, 7]);
+            // After it.
+            let list = host.new_list().unwrap();
+            super::ungroup(&list, gpu, (12, 2), 4);
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(read(), [3, 2, 1, 16_383, 1, 1, 7, 7, 7]);
         }
     }
 

@@ -91,7 +91,9 @@ fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u3
             roots: vec![(0, Root::Constants(data))],
             views: &views,
             samplers: &[],
-            groups: [groups, 1, 1],
+            // As the host dispatches it: regrouped, one host group per
+            // console wave.
+            groups: [groups * cs.regroup, 1, 1],
         },
     )?;
     Ok(out.into_iter().next().unwrap_or_default())
@@ -292,10 +294,12 @@ fn exchanges_inside_a_branch_one_half_skips() {
     });
 }
 
-/// Groups of several console waves need the halves to meet without a
-/// group barrier: not yet.
+/// Groups of several console waves that share nothing: on a host without
+/// 64-lane waves each console wave runs as a host group of its own (the
+/// host dispatching that many more along X), with the console's group and
+/// thread ids. Lane t reads lane 40 of its own console wave.
 #[test]
-fn console_flow_is_for_one_console_wave_per_group() {
+fn console_waves_sharing_nothing_run_as_groups_of_their_own() {
     let body = [
         0xD760_0009,
         0x0001_5100, // v_readlane_b32 s9, v0, 40
@@ -305,8 +309,67 @@ fn console_flow_is_for_one_console_wave_per_group() {
         lanes_min: 32,
         lanes_max: 32,
     };
-    assert!(emit_for(&program(&body, 64), nvidia).is_ok());
-    assert!(emit_for(&program(&body, 128), nvidia).is_err());
+    assert_eq!(
+        emit_for(&program(&body, 64), nvidia).map(|s| s.regroup),
+        Ok(1)
+    );
+    assert_eq!(
+        emit_for(&program(&body, 256), nvidia).map(|s| s.regroup),
+        Ok(4)
+    );
+    for threads in [128, 256] {
+        console_flow_case("v_readlane 40, several waves", &body, threads, |t| {
+            (t & !63) + 40
+        });
+    }
+    // Two-dimensional groups (16 x 8, 8 x 32): waves of the flat id; group
+    // g's lane f (f = x + X * y) stores lane 40's f at dword g * n + f.
+    for [x, y] in [[16u32, 8], [8, 32]] {
+        let n = x * y;
+        let mut words = vec![
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0101,
+            0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], null
+            0x9308_FF01,
+            n * 4,       // s_mul_i32 s8, s1, n * 4
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ];
+        words.extend_from_slice(&[
+            0x340A_0200 | (128 + x.trailing_zeros()), // v_lshlrev_b32 v5, log2 X, v1
+            0x4A08_0B00,                              // v_add_nc_u32 v4, v0, v5
+            0xD760_0009,
+            0x0001_5104, // v_readlane_b32 s9, v4, 40
+            0x7E04_0209, // v_mov_b32 v2, s9
+            0x3406_0882, // v_lshlrev_b32 v3, 2, v4
+            0x4A06_0608, // v_add_nc_u32 v3, s8, v3
+            0xE070_1000,
+            0x8001_0203, // buffer_store_dword v2, v3, s[4:7], 0 offen
+            S_ENDPGM,
+        ]);
+        let mut p = compute(&words, true);
+        p.layout = program(&[], 64).layout;
+        // One user SGPR, the group id x, thread ids x and y in v0, v1.
+        p.io = StageIo::Cs(crate::native::ComputeIo {
+            rsrc2: 1 << 1 | 1 << 7 | 1 << 11,
+            threads: [x, y, 1],
+        });
+        let Ok(names) = adapters() else {
+            return;
+        };
+        for name in names {
+            let Ok(host) = Host::on(&name) else {
+                continue;
+            };
+            let groups = 3;
+            let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let want: Vec<u32> = (0..groups)
+                .flat_map(|_| (0..n).map(|f| (f & !63) + 40))
+                .collect();
+            assert_eq!(out, want, "{name}: {x} x {y}");
+            eprintln!("{name}: {x} x {y} exact");
+        }
+    }
 }
 
 /// A loop lane t runs t times, with a lane read of the other half in

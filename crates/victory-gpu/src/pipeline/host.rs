@@ -311,6 +311,16 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 }
 
 impl HostPipeline {
+    /// Compute: host groups per console group along X, which dispatches
+    /// multiply X by (`victory_shader::emit::HostShader::regroup`; 1 for
+    /// the console's groups).
+    pub(crate) fn regroup(&self) -> u32 {
+        match self.stages.first() {
+            Some(s) if self.compute => s.translated().host.regroup.max(1),
+            _ => 1,
+        }
+    }
+
     /// A host pipeline for vertex (or mesh), geometry and pixel shaders
     /// with the graphics state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {

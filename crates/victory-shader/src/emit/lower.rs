@@ -53,6 +53,8 @@ pub(crate) struct Lowered {
     /// Marks the pages it writes through buffer views (`emit`, "Write
     /// marks").
     pub view_marks: bool,
+    /// Compute: host groups per console group (1: the console's groups).
+    pub regroup: u32,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -303,6 +305,11 @@ struct Lower<'a> {
     /// Why a wave64 program that needs its whole wave cannot take the
     /// console flow on a host without 64-lane waves.
     no_console_flow: Option<Why>,
+    /// A console group of `k` wave64s that share nothing (no LDS, no
+    /// `s_barrier`), and its thread shape: each console wave runs as a host
+    /// group of 64 threads, `k` host groups along X per console group
+    /// ([`Self::thread_id`], [`Self::group_id`]).
+    regroup: Option<(u32, [u32; 3])>,
     /// The console thread's flat id in the group (relabelled; see
     /// [`Self::thread_id`]).
     console_flat: Option<V>,
@@ -641,6 +648,7 @@ impl<'a> Lower<'a> {
         let mut split = false;
         let mut wants_console_flow = false;
         let mut no_console_flow = None;
+        let mut regroup = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -730,8 +738,21 @@ impl<'a> Lower<'a> {
             // reason it stops with.
             let needs_wave64 =
                 (console_lanes || one_wave && s.lds_dwords > 0) && !split && x.native.wave64;
+            // Waves of a group that share no LDS and meet at no barrier
+            // cannot tell they are in one group: in the console flow each
+            // runs as a group of its own (one console wave), the host
+            // dispatching `k` times the groups along X.
+            // shortcut: whole waves only; a group with a partial last wave
+            // stays refused.
+            let n = cs.threads.iter().product::<u32>();
+            let regroupable = x.native.wave64
+                && n > 64
+                && n.is_multiple_of(64)
+                && s.lds_dwords == 0
+                && !insts().any(|i| i.name() == "s_barrier");
             if needs_wave64 && !x.target.runs(64) {
-                no_console_flow = if cs.threads.iter().product::<u32>() > 64 {
+                let host_threads = if regroupable { 64 } else { n };
+                no_console_flow = if n > 64 && !regroupable {
                     Some(
                         "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
                     )
@@ -739,7 +760,7 @@ impl<'a> Lower<'a> {
                     .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
                 {
                     Some("ds_permute across the halves of a wave64 on a host without 64-lane waves")
-                } else if s.threads.map(|t| t.iter().product::<u32>()) != Some(64)
+                } else if host_threads != 64
                     && !(0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty())
                 {
                     Some("a whole-wave section of a wave64 on a host without 64-lane waves")
@@ -780,6 +801,13 @@ impl<'a> Lower<'a> {
                 console_lanes = true;
                 // In halves only where the host cannot run the console wave.
                 split = x.native.wave64 && !x.target.runs(64);
+                // (Decided here, not with the reasons above: the attempt
+                // that asked for the console flow may have read masks
+                // differently.)
+                if split && regroupable {
+                    regroup = Some((n / 64, cs.threads));
+                    s.threads = Some([64, 1, 1]);
+                }
             }
             if split {
                 s.wave_size = Some(32);
@@ -906,6 +934,7 @@ impl<'a> Lower<'a> {
             console_cf: x.console_cf,
             wants_console_flow,
             no_console_flow,
+            regroup,
             console_flat: None,
             xchg: None,
             flat: None,
@@ -1704,6 +1733,7 @@ impl<'a> Lower<'a> {
             heap: self.heap[0],
             heap_writes: self.heap[1],
             view_marks: self.s.view_writes.is_some(),
+            regroup: self.regroup.map_or(1, |r| r.0),
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -1799,7 +1829,7 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => return self.group_id(c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
@@ -1862,6 +1892,19 @@ impl<'a> Lower<'a> {
             }
         };
         self.load_input(id, col)
+    }
+
+    /// Component `c` of the console group's id: regrouped, `k` host groups
+    /// along X make one console group ([`Self::regroup`]).
+    fn group_id(&mut self, c: u8) -> Val {
+        let id = self.compute_id("groupId.i32", 94, c);
+        match (self.regroup, id) {
+            (Some((k, _)), Val::I32(g)) if c == 0 => {
+                let kk = self.s.m.i32(k);
+                Val::I32(self.s.m.bin(self.s.entry, Bin::UDiv, g, kk))
+            }
+            _ => id,
+        }
     }
 
     /// A component of a compute thread or group id, read in the entry block.
@@ -3317,9 +3360,21 @@ impl<'a> Lower<'a> {
         if !self.console_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
-        let [x, y, _] = self.s.threads.expect("compute");
+        let [x, y, _] = self
+            .regroup
+            .map_or(self.s.threads.expect("compute"), |r| r.1);
         let e = self.s.entry;
-        let f = self.console_flat();
+        let mut f = self.console_flat();
+        if let Some((k, _)) = self.regroup {
+            // The host group's place among the console group's waves.
+            let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+                unreachable!()
+            };
+            let (kk, k6) = (self.s.m.i32(k), self.s.m.i32(6));
+            let w = self.s.m.bin(e, Bin::URem, g, kk);
+            let base = self.s.m.bin(e, Bin::Shl, w, k6);
+            f = self.s.m.bin(e, Bin::Add, base, f);
+        }
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
         Val::I32(match c {
             0 => self.s.m.bin(e, Bin::URem, f, xk),
@@ -11926,18 +11981,11 @@ mod select_tests {
                 lanes_max: 32,
             };
             for target in [wave32_only, super::super::Target::ANY] {
-                let result = emit(&c, &native, &p, &st, &io, &res, target);
-                if uses_select && threads > 64 && !target.runs(64) {
-                    assert!(matches!(
-                        result,
-                        Err(crate::ShaderError::Unsupported {
-                            what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
-                            ..
-                        })
-                    ));
-                    continue;
-                }
-                let shader = result.unwrap();
+                let shader = emit(&c, &native, &p, &st, &io, &res, target).unwrap();
+                // Two console waves sharing nothing: one host group each
+                // where the console flow needs them apart.
+                let regrouped = uses_select && threads > 64 && !target.runs(64);
+                assert_eq!(shader.regroup, if regrouped { threads / 64 } else { 1 });
                 let emitted = Container::parse(&shader.dxil).unwrap();
                 let features = emitted.part(FourCC::SFI0).unwrap();
                 let wave_ops = u64::from_le_bytes(features.data.try_into().unwrap()) & 0x4000 != 0;
