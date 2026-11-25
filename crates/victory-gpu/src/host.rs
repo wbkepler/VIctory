@@ -2852,17 +2852,133 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .fold(state, |s, &(_, _, bits)| s & !bits)
 }
 
+/// Bytes of host copies in GPU upload heaps now ([`Host::gpu_upload_buffer`]):
+/// charged when one is made, given back when D3D12 destroys it
+/// ([`give_back_upload`]).
+static UPLOAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Called by D3D12 when a host copy in a GPU upload heap is destroyed (its
+/// last reference gone: the copy's, lists', and descriptor tables' clones
+/// of the resource): its `size` (the callback's data) leaves
+/// [`UPLOAD_BYTES`]. Counted for the whole run, the budget ran out after
+/// enough buffers came and went and every later copy stayed in system
+/// memory (64 copies of 32 MiB on an RTX 3050 Laptop, #2120).
+unsafe extern "system" fn give_back_upload(size: *mut std::ffi::c_void) {
+    UPLOAD_BYTES.fetch_sub(size as u64, Ordering::Relaxed);
+}
+
+/// [`UPLOAD_BYTES`], for tests.
+#[cfg(test)]
+pub(crate) fn upload_bytes() -> u64 {
+    UPLOAD_BYTES.load(Ordering::Relaxed)
+}
+
+/// Video memory host copies may take in GPU upload heaps; the rest stay in
+/// system memory.
+/// shortcut: a fixed amount; ask DXGI for the adapter's budget if 8 GB
+/// cards run short.
+const UPLOAD_BUDGET: u64 = 2 << 30;
+
 impl Host {
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_CUSTOM,
-            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
-            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
-            ..Default::default()
+        self.mapped_buffer(size, false)
+    }
+
+    /// A buffer in video memory that the CPU maps through the PCI BAR (a
+    /// GPU upload heap, `D3D12_OPTIONS16`): shaders read it as fast as any
+    /// video memory (on an RTX 5070 Ti ~720 GB/s against ~23 GB/s from
+    /// system memory), the CPU writes it about as fast as system memory,
+    /// and reading it from the CPU is very slow (~50 MB/s). For host copies
+    /// of title memory that shaders only read. None when the host has no
+    /// such heaps (no resizable BAR, older runtimes), `VICTORY_GPU_UPLOAD`
+    /// is off, or the copies there would pass [`UPLOAD_BUDGET`].
+    pub(crate) fn gpu_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if !self.gpu_upload() {
+            return None;
+        }
+        let size = size.max(1);
+        if UPLOAD_BYTES.fetch_add(size, Ordering::Relaxed) + size > UPLOAD_BUDGET {
+            UPLOAD_BYTES.fetch_sub(size, Ordering::Relaxed);
+            static FULL: std::sync::Once = std::sync::Once::new();
+            FULL.call_once(|| {
+                tracing::info!("host copies past the GPU upload budget go to system memory")
+            });
+            return None;
+        }
+        let Some((buffer, data)) = self.mapped_buffer(size, true) else {
+            UPLOAD_BYTES.fetch_sub(size, Ordering::Relaxed);
+            return None;
+        };
+        // The charge goes back when the buffer is destroyed, not when the
+        // copy drops: lists and descriptor tables may hold it longer.
+        // SAFETY: a live buffer; the callback's data is the size alone.
+        let watched = unsafe {
+            buffer
+                .cast::<windows::Win32::Graphics::Direct3D::ID3DDestructionNotifier>()
+                .and_then(|n| {
+                    n.RegisterDestructionCallback(Some(give_back_upload), size as *const _)
+                })
+        };
+        if watched.is_err() {
+            // Not given back when destroyed, it would count for good.
+            drop(buffer);
+            UPLOAD_BYTES.fetch_sub(size, Ordering::Relaxed);
+            static UNWATCHED: std::sync::Once = std::sync::Once::new();
+            UNWATCHED.call_once(|| {
+                tracing::info!(
+                    "no destruction callback on this host: host copies stay in system memory"
+                )
+            });
+            return None;
+        }
+        Some((buffer, data))
+    }
+
+    /// Whether host copies that shaders only read go to GPU upload heaps:
+    /// `VICTORY_GPU_UPLOAD=1` (a prototype, off by default) and a host that
+    /// has them. Asked once.
+    pub(crate) fn gpu_upload(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            if !crate::switch::on("VICTORY_GPU_UPLOAD") {
+                return false;
+            }
+            let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: a feature query writing the structure of its size.
+            let known = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut o).cast(),
+                    size_of_val(&o) as u32,
+                )
+            }
+            .is_ok();
+            let on = known && o.GPUUploadHeapSupported.as_bool();
+            tracing::info!(
+                on,
+                "host copies that shaders only read in GPU upload heaps (VICTORY_GPU_UPLOAD)"
+            );
+            on
+        })
+    }
+
+    fn mapped_buffer(&self, size: u64, upload: bool) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = if upload {
+            D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+                ..Default::default()
+            }
+        } else {
+            D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            }
         };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -2899,7 +3015,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                tracing::warn!(error = %e, size, "no shared buffer");
+                tracing::warn!(error = %e, size, upload, "no shared buffer");
                 None
             }
         }

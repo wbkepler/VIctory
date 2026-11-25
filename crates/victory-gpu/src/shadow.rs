@@ -46,6 +46,9 @@ pub(crate) struct Shadow {
     /// 64 KiB title page it touches (tracked memory only): writes through
     /// views of it are marked there ([`Shadow::mark_entry`]).
     marks: Option<u32>,
+    /// In a GPU upload heap ([`register_read_only`]): the CPU must not read
+    /// it back.
+    pub(crate) upload: std::sync::atomic::AtomicBool,
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -341,6 +344,7 @@ impl Shadow {
             pending: Mutex::default(),
             before: Mutex::default(),
             marks,
+            upload: std::sync::atomic::AtomicBool::new(false),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -385,6 +389,18 @@ impl Shadow {
     /// views (`victory_shader::emit`, "Write marks"): no snapshot then, only
     /// the pages they marked are compared ([`Shadow::copy_back_marked`]).
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
+        if self.upload.load(std::sync::atomic::Ordering::Relaxed) {
+            // A view of the memory that writes (through another resource,
+            // or a placed view) found this read-only buffer's copy: right,
+            // but its copy-back reads video memory at ~50 MB/s.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    start = format_args!("{:#x}", self.start),
+                    "shaders write the copy of a buffer made without unordered access, in upload memory: slow copy-back"
+                );
+            });
+        }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
     }
@@ -887,6 +903,9 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
+    /// The title made it without unordered access: shaders only read it,
+    /// so its copy may be in a GPU upload heap ([`register_read_only`]).
+    read_only: bool,
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
@@ -911,11 +930,24 @@ fn changed() {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
+    register_as(resource, start, len, false);
+}
+
+/// [`register`] for a buffer the title made without unordered access:
+/// shaders only read it, and the CPU only writes its copy (refreshes), so
+/// the copy can be in video memory the CPU writes through the PCI BAR
+/// ([`Host::gpu_upload_buffer`](crate::host::Host::gpu_upload_buffer)).
+pub(crate) fn register_read_only(resource: usize, start: u64, len: u64) {
+    register_as(resource, start, len, true);
+}
+
+fn register_as(resource: usize, start: u64, len: u64, read_only: bool) {
     buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
+            read_only,
         },
     );
 }
@@ -946,8 +978,19 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
-        // Shaders write some buffers (unordered access), so not upload memory.
-        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
+        // Shaders write some buffers (unordered access): only the others'
+        // copies may be in upload memory.
+        let size = len.next_multiple_of(1 << 16);
+        let host = host()?;
+        let upload = entry
+            .read_only
+            .then(|| host.gpu_upload_buffer(size))
+            .flatten();
+        let in_upload = upload.is_some();
+        let (buffer, data) = match upload {
+            Some(made) => made,
+            None => host.shared_buffer(size)?,
+        };
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -964,7 +1007,11 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 "buffer copied to the host"
             );
         }
-        entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len));
+        let shadow = Shadow::new(buffer, data, gpu, key.0, len);
+        shadow
+            .upload
+            .store(in_upload, std::sync::atomic::Ordering::Relaxed);
+        entry.shadow = Some(shadow);
         changed();
     }
     entry.shadow.clone()
@@ -1127,6 +1174,284 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    /// Runs this binary's test `name` again in a child process with
+    /// `VICTORY_GPU_UPLOAD=1` (the switch is read once per process): true
+    /// in that child, where the test does its work; false in the parent,
+    /// once the child passed.
+    fn rerun_with_gpu_upload(name: &str) -> bool {
+        const CHILD: &str = "VICTORY_TEST_GPU_UPLOAD_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                name,
+                "--exact",
+                "--test-threads=1",
+                "--nocapture",
+                "--include-ignored",
+            ])
+            .env(CHILD, "1")
+            .env("VICTORY_GPU_UPLOAD", "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{name} with VICTORY_GPU_UPLOAD=1:\n{text}"
+        );
+        assert!(text.contains("1 passed"), "{name} did not run:\n{text}");
+        eprintln!("{text}");
+        false
+    }
+
+    /// Read-only buffers come and go, more bytes of them in all than the
+    /// GPU upload budget, a few at a time: each one's copy still goes in a
+    /// GPU upload heap, and its bytes leave the budget once the last
+    /// reference to its buffer is gone (a clone, as descriptor tables hold,
+    /// keeps them charged). Counted for the whole run, copies went to
+    /// system memory for good after the budget's worth (#2120).
+    #[test]
+    fn upload_budget_is_given_back_when_copies_go() {
+        use windows::core::Interface;
+        if !rerun_with_gpu_upload("shadow::tests::upload_budget_is_given_back_when_copies_go") {
+            return;
+        }
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        if !host.gpu_upload() {
+            return; // no GPU upload heaps (resizable BAR) here
+        }
+        const LEN: usize = 128 << 20;
+        let p = crate::watch::tests::pool(LEN / PAGE);
+        let base = crate::host::upload_bytes();
+        // 2.5 GiB in all, past the 2 GiB budget.
+        for round in 0..20 {
+            register_read_only(p, p as u64, LEN as u64);
+            let copy = find(p as u64, LEN as u64).expect("a copy");
+            assert_eq!(
+                heap_type(&copy),
+                D3D12_HEAP_TYPE_GPU_UPLOAD,
+                "round {round}: in a GPU upload heap"
+            );
+            assert_eq!(
+                crate::host::upload_bytes(),
+                base + LEN as u64,
+                "round {round}: charged"
+            );
+            // A clone of the buffer, as a descriptor table holds, outlives
+            // the copy: still charged until it goes.
+            let held = copy.buffer.clone();
+            let weak = Arc::downgrade(&copy);
+            unregister(p, p as u64);
+            drop(copy);
+            assert!(weak.upgrade().is_none(), "round {round}: the copy is gone");
+            assert_eq!(
+                crate::host::upload_bytes(),
+                base + LEN as u64,
+                "round {round}: held"
+            );
+            assert!(!held.as_raw().is_null());
+            drop(held);
+            assert_eq!(
+                crate::host::upload_bytes(),
+                base,
+                "round {round}: given back"
+            );
+        }
+        crate::watch::tests::free(p);
+    }
+
+    /// The heap type a copy's buffer is in.
+    fn heap_type(copy: &Shadow) -> D3D12_HEAP_TYPE {
+        let mut props = D3D12_HEAP_PROPERTIES::default();
+        // SAFETY: a live committed buffer.
+        unsafe {
+            copy.buffer
+                .GetHeapProperties(Some(&mut props), None)
+                .unwrap()
+        };
+        props.Type
+    }
+
+    /// With `VICTORY_GPU_UPLOAD=1`, the copy of a buffer made without
+    /// unordered access is in a GPU upload heap: a refresh writes the
+    /// title's bytes there, and the GPU reads them (copied out into system
+    /// memory here). A buffer shaders may write keeps its copy in system
+    /// memory.
+    #[test]
+    fn read_only_buffers_get_their_copies_in_video_memory() {
+        if !rerun_with_gpu_upload(
+            "shadow::tests::read_only_buffers_get_their_copies_in_video_memory",
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        if !host.gpu_upload() {
+            return; // no GPU upload heaps (resizable BAR) here
+        }
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register_read_only(p, p as u64, len as u64);
+        let copy = find(p as u64, len as u64).expect("a copy");
+        assert!(copy.upload.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(heap_type(&copy), D3D12_HEAP_TYPE_GPU_UPLOAD);
+        // The title writes; the copy is refreshed; the GPU reads it.
+        // SAFETY: our pool's bytes.
+        let title = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, len) };
+        for (i, b) in title.iter_mut().enumerate() {
+            *b = (i % 253) as u8;
+        }
+        copy.update(p, len);
+        let (out, data) = host.shared_buffer(len as u64).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list; both buffers are live and start common.
+        unsafe {
+            list.list
+                .CopyBufferRegion(&out, 0, &copy.buffer, 0, len as u64)
+        };
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the mapped output, `len` bytes, the copy done.
+        let read = unsafe { std::slice::from_raw_parts(data, len) };
+        assert!(
+            read == &title[..],
+            "what the GPU read is what the title wrote"
+        );
+        unregister(p, p as u64);
+        // A buffer shaders may write.
+        let q = crate::watch::tests::pool(1);
+        register(q, q as u64, PAGE as u64);
+        let writable = find(q as u64, PAGE as u64).expect("a copy");
+        assert!(!writable.upload.load(std::sync::atomic::Ordering::Relaxed));
+        assert_ne!(heap_type(&writable), D3D12_HEAP_TYPE_GPU_UPLOAD);
+        unregister(q, q as u64);
+    }
+
+    /// A shader reading 256 MiB of a read-only buffer's copy (GPU upload
+    /// heap) and of a writable one's (system memory), with
+    /// `VICTORY_GPU_UPLOAD=1`.
+    /// `cargo test --release -p victory-gpu --lib reading_copies -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark: run in release with --ignored --nocapture"]
+    fn reading_copies_in_video_and_system_memory() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::{Interface, s};
+        if !rerun_with_gpu_upload("shadow::tests::reading_copies_in_video_and_system_memory") {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        if !host.gpu_upload() {
+            eprintln!("no GPU upload heaps here");
+            return;
+        }
+        const SRC: &str = r#"
+#define RS "SRV(t0), UAV(u0)"
+ByteAddressBuffer b : register(t0);
+RWByteAddressBuffer o : register(u0);
+[RootSignature(RS)]
+[numthreads(256, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint s = 0;
+    for (uint k = 0; k < 16; k++) s += b.Load((id.x * 16 + k) * 4);
+    if (s == 0x12345678) o.Store(0, s);
+}"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source outlives the call.
+        unsafe {
+            D3DCompile(
+                SRC.as_ptr().cast(),
+                SRC.len(),
+                s!("b"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .unwrap();
+        }
+        let code = code.unwrap();
+        // SAFETY: the blob's bytes; plain creation.
+        let (root, pso) = unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+        const BYTES: usize = 256 << 20;
+        let (out, _) = host.shared_buffer(256).unwrap();
+        for read_only in [false, true] {
+            let p = crate::watch::tests::pool(BYTES / PAGE);
+            if read_only {
+                register_read_only(p, p as u64, BYTES as u64);
+            } else {
+                register(p, p as u64, BYTES as u64);
+            }
+            let copy = find(p as u64, BYTES as u64).unwrap();
+            // The first refresh copies all of it (every page is new).
+            let t = std::time::Instant::now();
+            copy.update(p, BYTES);
+            let refresh = t.elapsed().as_secs_f64();
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let list = host.new_list().unwrap();
+                // SAFETY: an open list, live objects.
+                unsafe {
+                    list.list.SetComputeRootSignature(&root);
+                    list.list.SetPipelineState(&pso);
+                    list.list.SetComputeRootShaderResourceView(0, copy.gpu);
+                    list.list
+                        .SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+                    list.list.Dispatch((BYTES / 4 / 16 / 256) as u32, 1, 1);
+                }
+                list.close();
+                let t = std::time::Instant::now();
+                host.execute(&[&list]);
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            let _ = copy.buffer.as_raw();
+            eprintln!(
+                "{}: shader reads 256 MiB in {:.2} ms ({:.1} GB/s); refresh writes it in {:.1} ms ({:.1} GB/s)",
+                if read_only {
+                    "read-only buffer's copy (GPU upload heap)"
+                } else {
+                    "writable buffer's copy (system memory)"
+                },
+                best * 1e3,
+                BYTES as f64 / best / 1e9,
+                refresh * 1e3,
+                BYTES as f64 / refresh / 1e9
+            );
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+        }
+    }
 
     /// The title writes a constant under a range an earlier list of the
     /// submission declared as written by shaders: the refresh before the
