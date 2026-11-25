@@ -91,22 +91,36 @@ const POOL_BYTES: usize = 2 << 30;
 /// The runs `[start, end)` of bytes where the copy differs from title
 /// memory (`host`, `title`: the same bytes of each) and `gpu(i)` says the
 /// GPU wrote byte `i`: what a copy-back puts into title memory.
+///
+/// Equal stretches (most of a page) are skipped a block at a time, then a
+/// line at a time inside a block that differs: one comparison per 8 bytes
+/// cost ~30 us per 64 KiB page, ~70 ms per world frame of marked pages.
 fn differing(host: &[u8], title: &[u8], gpu: impl Fn(usize) -> bool) -> Vec<(usize, usize)> {
+    const BLOCK: usize = 1 << 10;
+    const LINE: usize = 32;
+    let n = host.len().min(title.len());
     let mut runs: Vec<(usize, usize)> = Vec::new();
-    let mut i = 0;
-    while i < host.len() {
-        // Equal stretches a word at a time (most of a page is).
-        if i.is_multiple_of(8) && i + 8 <= host.len() && host[i..i + 8] == title[i..i + 8] {
-            i += 8;
-            continue;
-        }
-        if host[i] != title[i] && gpu(i) {
-            match runs.last_mut() {
-                Some((_, end)) if *end == i => *end = i + 1,
-                _ => runs.push((i, i + 1)),
+    let mut block = 0;
+    while block < n {
+        let block_end = (block + BLOCK).min(n);
+        if host[block..block_end] != title[block..block_end] {
+            let mut line = block;
+            while line < block_end {
+                let line_end = (line + LINE).min(block_end);
+                if host[line..line_end] != title[line..line_end] {
+                    for i in line..line_end {
+                        if host[i] != title[i] && gpu(i) {
+                            match runs.last_mut() {
+                                Some((_, end)) if *end == i => *end = i + 1,
+                                _ => runs.push((i, i + 1)),
+                            }
+                        }
+                    }
+                }
+                line = line_end;
             }
         }
-        i += 1;
+        block = block_end;
     }
     runs
 }
@@ -1295,6 +1309,52 @@ mod tests {
         );
         assert_eq!(host(PAGE + 40), 0x88, "the copy reads the title's byte");
         unregister(p, p as u64);
+    }
+
+    /// The block-wise comparison finds the same runs as a byte-wise one:
+    /// across block and line edges, at the ends, with the GPU's bytes told
+    /// apart, and for lengths that are not whole blocks.
+    #[test]
+    fn differing_matches_a_byte_wise_comparison() {
+        let naive = |host: &[u8], title: &[u8], gpu: &dyn Fn(usize) -> bool| {
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            for i in 0..host.len() {
+                if host[i] != title[i] && gpu(i) {
+                    match runs.last_mut() {
+                        Some((_, end)) if *end == i => *end = i + 1,
+                        _ => runs.push((i, i + 1)),
+                    }
+                }
+            }
+            runs
+        };
+        for len in [0, 1, 31, 33, 1023, 1025, PAGE - 7, PAGE] {
+            let title = vec![0x5au8; len];
+            let mut host = title.clone();
+            // Single bytes, runs over line and block edges, the last byte.
+            let mut at = 3;
+            while at < len {
+                host[at] ^= 0xff;
+                at += 997;
+            }
+            for i in (1020..1060).filter(|&i| i < len) {
+                host[i] = 0;
+            }
+            if let Some(last) = host.last_mut() {
+                *last = 1;
+            }
+            let gpu = |i: usize| !i.is_multiple_of(5);
+            assert_eq!(
+                differing(&host, &title, gpu),
+                naive(&host, &title, &gpu),
+                "length {len}"
+            );
+            assert_eq!(
+                differing(&host, &title, |_| true),
+                naive(&host, &title, &|_| true),
+                "length {len}"
+            );
+        }
     }
 
     /// Mark bits are handed out in runs and come back joined.
