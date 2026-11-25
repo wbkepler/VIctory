@@ -106,6 +106,10 @@ impl Drop for State {
 /// The key of our own view heap (`crate::memory::heap`) among the title's.
 const MEMORY_HEAP: usize = crate::memory::OURS;
 
+/// The sampler heap we bind when the title binds none (a value no title heap
+/// address takes).
+const SAMPLERS_OURS: usize = usize::MAX;
+
 /// Dynamic slots taken at a time for root views.
 const ROOT_VIEW_RUN: u32 = 256;
 
@@ -837,22 +841,47 @@ impl State {
     }
 
     /// Gives the host list the title's heaps if it has others.
-    fn bind_heaps(&mut self, list: &HostList, memory_heap: bool) {
-        let want = if memory_heap {
-            [MEMORY_HEAP, self.heaps[1]]
+    /// The heaps a list must have bound before a root signature that indexes
+    /// them directly is set: the title's of each kind, and ours for a kind it
+    /// binds none of — D3D12 requires a heap of both kinds to be bound before
+    /// such a signature (the debug layer's id 1419), and breaking that rule
+    /// removes the device on NVIDIA. Compute lists that only read views are
+    /// the case: they bind no sampler heap, and every signature we make says
+    /// its sampler heap is indexed directly.
+    fn wanted(title: [usize; 2], memory_heap: bool) -> [usize; 2] {
+        let sampler = if title[1] != 0 {
+            title[1]
         } else {
-            self.heaps
+            SAMPLERS_OURS
         };
+        let views = if memory_heap { MEMORY_HEAP } else { title[0] };
+        [views, sampler]
+    }
+
+    /// Gives the host list the title's heaps if it has others.
+    fn bind_heaps(&mut self, list: &HostList, memory_heap: bool) {
+        let want = Self::wanted(self.heaps, memory_heap);
         if self.host_heaps != want {
             let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
                 .heaps
                 .iter()
-                .filter(|&&h| h != 0)
+                .filter(|&&h| h != 0 && h != SAMPLERS_OURS)
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
                 .map(|h| Some(h.heap.clone()))
                 .collect();
             if memory_heap && let Some(h) = crate::memory::heap() {
                 heaps.insert(0, Some(h.heap.clone()));
+            }
+            if want[1] == SAMPLERS_OURS {
+                match crate::descriptor::fallback_samplers() {
+                    Some(h) => {
+                        tracing::debug!("the title binds no sampler heap: binding ours");
+                        heaps.push(Some(h.heap.clone()));
+                    }
+                    None => {
+                        once!("no sampler heap of ours to bind");
+                    }
+                }
             }
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
@@ -1909,6 +1938,24 @@ fn fresh_range(entries: impl Iterator<Item = u32> + Clone, mirrored: u32) -> (u3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A root signature that indexes the heaps directly needs one of each
+    /// kind bound before it is set: our sampler heap stands in for a title
+    /// that binds none, which a compute list that only reads views does.
+    #[test]
+    fn a_list_without_a_sampler_heap_gets_ours() {
+        // The title binds both: nothing of ours.
+        assert_eq!(State::wanted([0x10, 0x20], false), [0x10, 0x20]);
+        // Views only: our sampler heap after them.
+        assert_eq!(State::wanted([0x10, 0], false), [0x10, SAMPLERS_OURS]);
+        // Neither, with title memory's views needed: ours of both kinds.
+        assert_eq!(
+            State::wanted([0, 0], true),
+            [MEMORY_HEAP, SAMPLERS_OURS]
+        );
+        // A title sampler heap stays whatever the views are.
+        assert_eq!(State::wanted([0, 0x20], true), [MEMORY_HEAP, 0x20]);
+    }
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
