@@ -520,6 +520,11 @@ impl State {
         if list.take_rebind() {
             (self.host_pipeline, self.host_roots[1]) = (0, 0);
         }
+        // Compute work may write the arguments of indirect draws after it:
+        // they get a clamp of their own (`crate::indirect`).
+        if compute {
+            crate::indirect::end(list);
+        }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them. Title memory's views need a view heap: ours where
         // the title binds none (the BVH builder's dispatches may not).
@@ -587,6 +592,9 @@ impl State {
                 .flatten()
             {
                 list.defer_heap(&host.viewed);
+            }
+            if writes {
+                crate::indirect::wrote_anywhere(list);
             }
             crate::bindless::note_draw(writes);
         }
@@ -769,6 +777,7 @@ impl State {
                         l.SetGraphicsRootShaderResourceView(param, table);
                     }
                     if let Some(param) = stage.memory_dirty {
+                        crate::indirect::wrote_anywhere(list);
                         if compute {
                             l.SetComputeRootUnorderedAccessView(param, dirty);
                         } else {
@@ -1651,13 +1660,19 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        // Bounded first: a clamp binds a compute pipeline of its own (draws
+        // that join a batch record none, and keep what is bound).
+        let offset = args.offset(arguments);
+        let at = (args.gpu(arguments) - offset, offset, arguments);
+        let Some(bound) = crate::indirect::bounded(list, &args.buffer, at, (kind, stride, max), kind == DISPATCH)
+        else {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
+        };
+        if bound.replaced_compute() {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
         }
-        self.host_pipeline = 0;
-        self.host_roots[1] = 0;
         let ran = match kind {
             DRAW | INDEXED => {
                 (self.topology != RECTANGLES || self.completes_rectangles() || {
@@ -1673,7 +1688,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            bound.done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1712,7 +1727,7 @@ impl State {
             let name = crate::pipeline::shaders_of(pipeline);
             crate::capture::read_indirect(list, (&args.buffer, args.offset(arguments)), count, (kind, stride, max), name);
         }
-        crate::indirect::done(list, &args.buffer);
+        bound.done(list, &args.buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

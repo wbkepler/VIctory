@@ -495,6 +495,8 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// The indirect draws one clamp of their arguments bounds (`indirect`).
+    indirect: Mutex<crate::indirect::Batches>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -834,6 +836,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
+                indirect: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1420,6 +1423,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        crate::indirect::end(self);
         for (from, to, bytes) in &self.deferred().read_backs {
             // SAFETY: an open list; buffers of ours it holds.
             unsafe {
@@ -1452,6 +1456,7 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
+        *self.indirect() = crate::indirect::Batches::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1734,6 +1739,12 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len, marked));
+        crate::indirect::wrote(self, address as u64, len as u64);
+    }
+
+    /// The list's batch of indirect draws (`crate::indirect`).
+    pub(crate) fn indirect(&self) -> std::sync::MutexGuard<'_, crate::indirect::Batches> {
+        self.indirect.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Shaders of the list take views from the heap itself
@@ -2830,6 +2841,8 @@ struct Meter {
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
+    /// Frames since the argument clamps' reasons were last logged.
+    clamp_frames: f64,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
 }
@@ -2844,6 +2857,7 @@ impl Meter {
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
+            clamp_frames: 0.0,
             caption: None,
         }
     }
@@ -2885,6 +2899,9 @@ impl Meter {
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
+        let (clamps, bounded) = crate::indirect::take_counts();
+        self.clamp_frames += frames;
+        let (clamps, bounded) = (clamps as f64 / frames, bounded as f64 / frames);
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
@@ -2896,8 +2913,18 @@ impl Meter {
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
+                 {indirect:.0} indirect; {root_views:.0} root-view slots/frame; {clamps:.0} \
+                 argument clamps for {bounded:.0} indirect executions/frame",
                 making = crate::pipeline::making()
+            );
+            let [none, buffer, anywhere, range, full, synced] =
+                crate::indirect::take_reasons().map(|n| n as f64 / self.clamp_frames.max(1.0));
+            self.clamp_frames = 0.0;
+            tracing::info!(
+                "argument clamps opened per frame: {none:.0} with none open (a list's first indirect \
+                 draw, or the first after compute work), {buffer:.0} for another argument buffer, \
+                 {anywhere:.0} after shader writes anywhere, {range:.0} over a written range, {full:.0} \
+                 with the job memory full; {synced:.0} barriers alone after declared writes"
             );
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             tracing::info!(
