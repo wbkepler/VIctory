@@ -31,8 +31,8 @@ pub(crate) struct HostHeap {
     /// them; elsewhere title slot `i` is host slot `i`.
     blocks: Option<Blocks>,
     /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
-    /// where the host takes them (also in a capped heap, [`capped_layout`]),
-    /// else [`MIN_DYNAMIC`].
+    /// where the host takes them, [`CAPPED_DYNAMIC`] in a capped heap
+    /// ([`capped_layout`]), else [`MIN_DYNAMIC`].
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -110,6 +110,13 @@ const DYNAMIC: u32 = 1 << 18;
 /// title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+/// The dynamic slots of a heap on a host that caps its view heaps
+/// ([`capped_layout`]): each one is a title slot fewer. The world on an
+/// RTX 5090 took at most ~111,500 at once (while it loads; 55,000-77,000
+/// after), and beside 2^18 of them the title's views wanted ~300 blocks
+/// more than the heap had left.
+const CAPPED_DYNAMIC: u32 = 1 << 17;
+
 /// The slots a capped heap keeps for host copies' view pairs
 /// (`crate::memory`) when the title's slots do not all fit: pairs live as
 /// long as their copies, and taken from the dynamic slots instead they
@@ -129,6 +136,10 @@ const NONE: u32 = u32::MAX;
 /// out table slots from chunks of a few thousand.)
 const GROUP: usize = 4;
 
+/// The most title blocks whose waiting views one sync makes
+/// ([`HostHeap::retry`]).
+const RETRY_BLOCKS: usize = 16;
+
 /// How the `views` slots of a view heap are shared on a host that makes no
 /// larger one (1,000,000 on NVIDIA): the slots for the title's at most, its
 /// dynamic slots, and the slots kept for view pairs past them. The last
@@ -137,10 +148,10 @@ const GROUP: usize = 4;
 ///
 /// The dynamic slots come first: tables whose slots the heap does not hold
 /// in one run are made afresh in dynamic slots for every draw, and 2^16 of
-/// those ran out in seconds.
+/// those ran out in seconds ([`CAPPED_DYNAMIC`]).
 fn capped_layout(views: u32) -> (u32, u32, u32) {
     let room = views.saturating_sub(3);
-    let dynamic = DYNAMIC.min(room / 2);
+    let dynamic = CAPPED_DYNAMIC.min(room / 2);
     let pairs = CAPPED_PAIRS.min(room / 8) & !1;
     (room - dynamic - pairs, dynamic, pairs)
 }
@@ -200,8 +211,57 @@ struct BlockMap {
     /// (a bit per title slot).
     views: Vec<u32>,
     held: Vec<u64>,
+    /// The host blocks not taken.
+    free: usize,
+    /// Per title slot holding a view that found no host block free, its
+    /// record's key (else 0): the sync skips it while the title leaves it
+    /// unchanged, and it is made once a host block is free for its block
+    /// ([`HostHeap::retry`]). How many each title block has, and in all.
+    waiting: Vec<u64>,
+    waiting_in: Vec<u32>,
+    unplaced: usize,
+    /// Whether some waiting slot may now find a host slot: its block has
+    /// one, or a host block was given back.
+    retry: bool,
     /// The most host blocks taken at once so far (logged as it grows).
     peak: usize,
+    /// Diagnostics: per title block, when a view was last written there or
+    /// a table read through it ([`stats::TICK`]).
+    #[cfg(feature = "diagnostics")]
+    touched: Vec<u32>,
+}
+
+/// Diagnostics: how capped heaps' blocks and dynamic slots are used.
+#[cfg(feature = "diagnostics")]
+pub(crate) mod stats {
+    use std::sync::atomic::AtomicU64;
+    /// Microseconds in `sync_heaps`.
+    pub(crate) static SYNC_US: AtomicU64 = AtomicU64::new(0);
+    /// Title slots brought up to date (`set_slot`), and those of them
+    /// holding a view without a host slot.
+    pub(crate) static VISITS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static UNPLACED_VISITS: AtomicU64 = AtomicU64::new(0);
+    /// Dynamic slots taken now, and the most since the last log.
+    pub(crate) static DYNAMIC_USED: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static DYNAMIC_PEAK: AtomicU64 = AtomicU64::new(0);
+    /// Tenths of a second since the first sync, as of the last one (when
+    /// title blocks were last written or read through a table).
+    pub(crate) static TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// Brings [`TICK`] up to date (each sync).
+    pub(crate) fn tick() {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let tenths = START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis()
+            / 100;
+        TICK.store(tenths as u32, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(super) fn now() -> u32 {
+        TICK.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl BlockMap {
@@ -209,6 +269,10 @@ impl BlockMap {
     /// predecessor's or before its successor's where that is free, else
     /// the first of a free group, else any.
     fn take(&mut self, block: usize) -> Option<u32> {
+        // Every visit of a waiting slot would search the whole heap.
+        if self.free == 0 {
+            return None;
+        }
         let free = |h: usize| self.taken.get(h) == Some(&false);
         let mapped = |b: Option<usize>| b.and_then(|b| self.host.get(b)).filter(|&&h| h != NONE).map(|&h| h as usize);
         let after = mapped(block.checked_sub(1)).map(|h| h + 1).filter(|&h| free(h));
@@ -218,12 +282,70 @@ impl BlockMap {
         let h = after.or_else(before).or_else(group).or_else(any)?;
         self.taken[h] = true;
         self.host[block] = h as u32;
-        let used = self.taken.iter().filter(|&&taken| taken).count();
-        if used > self.peak && (used.is_power_of_two() || used % 64 == 0) {
+        self.free -= 1;
+        let used = self.taken.len() - self.free;
+        if used > self.peak && (used.is_power_of_two() || used.is_multiple_of(64)) {
             tracing::info!(used, of = self.taken.len(), "host view heap: blocks of title slots in use");
         }
         self.peak = self.peak.max(used);
+        if self.waiting_in[block] > 0 {
+            self.retry = true;
+        }
         Some(h as u32)
+    }
+
+    /// Title slot `index` waits for a host slot with its record's `key`,
+    /// or (`None`) does not.
+    fn wait(&mut self, index: u32, key: Option<u64>) {
+        let (slot, block) = (index as usize, (index / BLOCK) as usize);
+        let new = key.unwrap_or(0);
+        let old = std::mem::replace(&mut self.waiting[slot], new);
+        match (old != 0, new != 0) {
+            (false, true) => {
+                self.waiting_in[block] += 1;
+                self.unplaced += 1;
+            }
+            (true, false) => {
+                self.waiting_in[block] -= 1;
+                self.unplaced -= 1;
+            }
+            _ => {}
+        }
+    }
+
+    /// A title block whose waiting slots can be made now (it has a host
+    /// block, or one is free: the block with the most waiting), and those
+    /// slots with their keys.
+    fn ready(&mut self) -> Option<Vec<(u32, u64)>> {
+        if !self.retry || self.unplaced == 0 {
+            self.retry = false;
+            return None;
+        }
+        let waiting = |b: &usize| self.waiting_in[*b] > 0;
+        let block = (0..self.host.len())
+            .filter(waiting)
+            .find(|&b| self.host[b] != NONE)
+            .or_else(|| {
+                (self.free > 0)
+                    .then(|| {
+                        (0..self.host.len())
+                            .filter(waiting)
+                            .max_by_key(|&b| self.waiting_in[b])
+                    })
+                    .flatten()
+            });
+        let Some(block) = block else {
+            self.retry = false;
+            return None;
+        };
+        let first = block * BLOCK as usize;
+        let end = (first + BLOCK as usize).min(self.waiting.len());
+        Some(
+            (first..end)
+                .filter(|&i| self.waiting[i] != 0)
+                .map(|i| (i as u32, self.waiting[i]))
+                .collect(),
+        )
     }
 }
 
@@ -336,7 +458,14 @@ impl HostHeap {
                     taken: vec![!sparse; host_blocks as usize],
                     views: vec![0; wanted as usize],
                     held: vec![0; if sparse { count.div_ceil(64) as usize } else { 0 }],
+                    free: if sparse { host_blocks as usize } else { 0 },
+                    waiting: vec![0; if sparse { count as usize } else { 0 }],
+                    waiting_in: vec![0; if sparse { wanted as usize } else { 0 }],
+                    unplaced: 0,
+                    retry: false,
                     peak: 0,
+                    #[cfg(feature = "diagnostics")]
+                    touched: vec![0; if sparse { wanted as usize } else { 0 }],
                 }),
             });
             match make(views) {
@@ -544,6 +673,12 @@ impl HostHeap {
         };
         taken[first..first + n].fill(true);
         *next = ((first + n) % self.dynamic as usize) as u32;
+        #[cfg(feature = "diagnostics")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let used = stats::DYNAMIC_USED.fetch_add(n as u64, Relaxed) + n as u64;
+            stats::DYNAMIC_PEAK.fetch_max(used, Relaxed);
+        }
         Some(self.count + first as u32)
     }
 
@@ -596,10 +731,11 @@ impl HostHeap {
         (host != NONE).then(|| host * BLOCK + index % BLOCK)
     }
 
-    /// The host slot of title slot `index`, which holds a view now
-    /// (`view`) or none: its block takes a host block with its first view.
-    /// None if the heap has no slot for it.
-    fn place(&self, index: u32, view: bool) -> Option<u32> {
+    /// The host slot of title slot `index`, which holds a view now (its
+    /// record's `key`) or none: its block takes a host block with its first
+    /// view. None if the heap has no slot for it; a view in a block that
+    /// found no host block free waits for one ([`HostHeap::retry`]).
+    fn place(&self, index: u32, key: Option<u64>) -> Option<u32> {
         let Some(blocks) = self.blocks.as_ref().filter(|b| b.sparse) else {
             return self.slot(index);
         };
@@ -608,14 +744,21 @@ impl HostHeap {
         }
         let mut map = blocks.map.lock().unwrap_or_else(|e| e.into_inner());
         let block = (index / BLOCK) as usize;
+        let (word, bit) = ((index / 64) as usize, 1u64 << (index % 64));
+        #[cfg(feature = "diagnostics")]
+        if key.is_some() {
+            map.touched[block] = stats::now();
+        }
         if map.host[block] == NONE {
-            if !view {
+            let host = if key.is_some() { map.take(block) } else { None };
+            let Some(host) = host else {
+                map.wait(index, key);
                 return None;
-            }
-            let host = map.take(block)?;
+            };
             blocks.write(block, host * BLOCK);
         }
-        let (word, bit) = ((index / 64) as usize, 1u64 << (index % 64));
+        map.wait(index, None);
+        let view = key.is_some();
         if view && map.held[word] & bit == 0 {
             map.held[word] |= bit;
             map.views[block] += 1;
@@ -642,6 +785,33 @@ impl HostHeap {
             blocks.write(block, blocks.null);
             map.host[block] = NONE;
             map.taken[host as usize] = false;
+            map.free += 1;
+            if map.unplaced > 0 {
+                map.retry = true;
+            }
+        }
+    }
+
+    /// Makes title slots that waited for a host slot (`BlockMap::waiting`)
+    /// where one is there now: in blocks that took a host block for a view
+    /// written since, or that find one given back. A few blocks per call.
+    fn retry(&self, made: &mut [u64]) {
+        if self.blocks.as_ref().is_none_or(|b| !b.sparse) {
+            return;
+        }
+        for _ in 0..RETRY_BLOCKS {
+            let ready = {
+                let blocks = self.blocks.as_ref().expect("checked");
+                blocks.map.lock().unwrap_or_else(|e| e.into_inner()).ready()
+            };
+            let Some(ready) = ready else { return };
+            for (index, key) in ready {
+                // Still the view the title wrote there, unless it went
+                // stale meanwhile (then the slot waits no more).
+                let view = view_at(key as u32, (key >> 32) as u32);
+                let key = if view.is_some() { key } else { 0 };
+                self.set_slot(made, index, key, view.as_ref(), false);
+            }
         }
     }
 
@@ -656,11 +826,131 @@ impl HostHeap {
         if last < first || last >= self.title {
             return None;
         }
-        let map = blocks.map.lock().unwrap_or_else(|e| e.into_inner());
+        #[allow(unused_mut)]
+        let mut map = blocks.map.lock().unwrap_or_else(|e| e.into_inner());
         let (from, to) = ((first / BLOCK) as usize, (last / BLOCK) as usize);
+        #[cfg(feature = "diagnostics")]
+        map.touched[from..=to].fill(stats::now());
         (from..=to)
             .all(|b| map.host[from] != NONE && map.host[b] == map.host[from] + (b - from) as u32)
             .then_some(at)
+    }
+
+    /// Diagnostics: logs how the title blocks and dynamic slots are used,
+    /// over the last `frames` frames.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn log_stats(&self, frames: f64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.sampler {
+            return;
+        }
+        let frames = frames.max(1.0);
+        let per = |a: &std::sync::atomic::AtomicU64| a.swap(0, Relaxed) as f64 / frames;
+        let (sync_ms, visits, unplaced_visits) = (
+            per(&stats::SYNC_US) / 1000.0,
+            per(&stats::VISITS),
+            per(&stats::UNPLACED_VISITS),
+        );
+        let used_now = stats::DYNAMIC_USED.load(Relaxed);
+        let dyn_peak = stats::DYNAMIC_PEAK.swap(used_now, Relaxed);
+        let Some(blocks) = self.blocks.as_ref().filter(|b| b.sparse) else {
+            tracing::info!(
+                sync_ms,
+                visits,
+                dyn_used = used_now,
+                dyn_peak,
+                of = self.dynamic,
+                "host view heap stats"
+            );
+            return;
+        };
+        let map = blocks.map.lock().unwrap_or_else(|e| e.into_inner());
+        let used = map.taken.iter().filter(|&&t| t).count();
+        // Mapped blocks by how many views they hold.
+        let mut hist = [0usize; 6];
+        let (mut span, mut wanting) = (0usize, 0usize);
+        // Chunks of 64, 128, 256 and 1024 title slots holding a view (placed
+        // or not): what blocks of that size would need.
+        let mut chunks = [0usize; 4];
+        let words = (BLOCK / 64) as usize;
+        // Blocks with a host block, and blocks waiting for one, by how long
+        // ago a view was written there or a table read: under 1 s, 5 s, 30 s,
+        // more.
+        let (mut mapped_age, mut waiting_age) = ([0usize; 4], [0usize; 4]);
+        let now = stats::now();
+        for b in 0..map.host.len() {
+            let age = now.saturating_sub(map.touched[b]);
+            let bucket = [10, 50, 300].iter().position(|&a| age < a).unwrap_or(3);
+            if map.host[b] != NONE {
+                mapped_age[bucket] += 1;
+            } else if map.waiting_in[b] > 0 {
+                waiting_age[bucket] += 1;
+            }
+        }
+        for b in 0..map.host.len() {
+            let w = &map.held[b * words..((b + 1) * words).min(map.held.len())];
+            let mut any = w.to_vec();
+            if map.waiting_in[b] > 0 {
+                let first = b * BLOCK as usize;
+                for i in first..(first + BLOCK as usize).min(map.waiting.len()) {
+                    if map.waiting[i] != 0 {
+                        any[(i - first) / 64] |= 1 << (i % 64);
+                    }
+                }
+            }
+            if any.iter().any(|&x| x != 0) {
+                wanting += 1;
+            }
+            for (i, k) in [1usize, 2, 4, 16].into_iter().enumerate() {
+                chunks[i] += any.chunks(k).filter(|c| c.iter().any(|&x| x != 0)).count();
+            }
+            if map.host[b] == NONE {
+                continue;
+            }
+            let n = map.views[b];
+            let bucket = match n {
+                0..=1 => 0,
+                2..=4 => 1,
+                5..=32 => 2,
+                33..=128 => 3,
+                129..=512 => 4,
+                _ => 5,
+            };
+            hist[bucket] += 1;
+            let first = w.iter().position(|&x| x != 0);
+            let last = w.iter().rposition(|&x| x != 0);
+            if let (Some(f), Some(l)) = (first, last) {
+                let lo = f * 64 + w[f].trailing_zeros() as usize;
+                let hi = l * 64 + 63 - w[l].leading_zeros() as usize;
+                span += hi + 1 - lo;
+            }
+        }
+        tracing::info!(
+            sync_ms,
+            visits,
+            unplaced_visits,
+            blocks = used,
+            of = map.taken.len(),
+            wanting,
+            unplaced = map.unplaced,
+            mapped_age = ?mapped_age,
+            waiting_age = ?waiting_age,
+            views_1 = hist[0],
+            views_4 = hist[1],
+            views_32 = hist[2],
+            views_128 = hist[3],
+            views_512 = hist[4],
+            views_1024 = hist[5],
+            span,
+            chunks_64 = chunks[0],
+            chunks_128 = chunks[1],
+            chunks_256 = chunks[2],
+            chunks_1024 = chunks[3],
+            dyn_used = used_now,
+            dyn_peak,
+            dyn_of = self.dynamic,
+            "host view heap stats (per frame: sync_ms, visits; blocks by views held)"
+        );
     }
 
     /// The view-block table, for root SRV `VIEW_BLOCKS`: every view heap of
@@ -680,6 +970,11 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
+            #[cfg(feature = "diagnostics")]
+            stats::DYNAMIC_USED.fetch_sub(
+                slots.iter().filter(|&&t| t).count() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             slots.fill(false);
         }
     }
@@ -956,6 +1251,7 @@ impl HostHeap {
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let placed = self.set_slot(&mut made, index, key, view.as_ref(), for_draw);
+        self.retry(&mut made);
         if placed { view } else { None }
     }
 
@@ -963,9 +1259,11 @@ impl HostHeap {
     /// names if any) up to date in `made`, which is by host slot. Whether
     /// the slot has a host slot.
     fn set_slot(&self, made: &mut [u64], index: u32, key: u64, view: Option<&View>, for_draw: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        stats::VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Where the title's slot lies in this heap (`index` is the title's
         // from here on, `slot` the host's).
-        let Some(slot) = self.place(index, view.is_some()) else {
+        let Some(slot) = self.place(index, view.is_some().then_some(key)) else {
             // A title slot the host heap has none for: past a heap the host
             // caps, or in a block that found no host block free. Shaders
             // indexing the heap itself read nothing there. That is only
@@ -973,6 +1271,8 @@ impl HostHeap {
             // writes are counted (the title also writes null and stale
             // records over its whole heap, which say nothing).
             if view.is_some() {
+                #[cfg(feature = "diagnostics")]
+                stats::UNPLACED_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let writes = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if writes.is_power_of_two() {
@@ -1049,7 +1349,14 @@ impl HostHeap {
                 return key;
             }
         }
-        u64::from(blocks.sparse && map.held[(index / 64) as usize] & (1u64 << (index % 64)) != 0)
+        if !blocks.sparse {
+            return 0;
+        }
+        // A view waiting for a host slot: unchanged, it is not visited.
+        match map.waiting[index as usize] {
+            0 => u64::from(map.held[(index / 64) as usize] & (1u64 << (index % 64)) != 0),
+            key => key,
+        }
     }
 
     /// Makes title slots `first..last` from safely copied title bytes `bytes`
@@ -1079,6 +1386,7 @@ impl HostHeap {
         for (index, key, view) in changed {
             self.set_slot(&mut guard, index, key, view.as_ref(), false);
         }
+        self.retry(&mut guard);
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -2149,7 +2457,8 @@ mod tests {
             let limit = victory_shader::emit::host::Host { device: host().unwrap().device.clone() }.view_heap_limit();
             assert_eq!(views, limit, "what the host makes");
             assert!(heap.heap.GetDesc().NumDescriptors >= views);
-            assert_eq!(heap.dynamic, DYNAMIC);
+            let capped = views < victory_shader::emit::HEAP_VIEWS;
+            assert_eq!(heap.dynamic, if capped { CAPPED_DYNAMIC } else { DYNAMIC });
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }
@@ -2212,8 +2521,11 @@ mod tests {
     /// view pairs, then the null buffer views and the clamp's slot.
     #[test]
     fn a_capped_heap_keeps_dynamic_slots_pairs_and_null_views() {
-        // 703 blocks for the title's slots and a null one.
-        assert_eq!(capped_layout(PORTABLE_VIEWS), (721_469, DYNAMIC, CAPPED_PAIRS));
+        // 831 blocks for the title's slots and a null one.
+        assert_eq!(
+            capped_layout(PORTABLE_VIEWS),
+            (852_541, CAPPED_DYNAMIC, CAPPED_PAIRS)
+        );
         assert_eq!(capped_layout(1 << 16), (24_577, 32_766, 8190));
         assert_eq!(capped_layout(2), (0, 0, 0));
         let Some(host) = host() else {
@@ -2356,6 +2668,67 @@ mod tests {
         heap.mirror_bytes(index, index + 1, 32, &bytes(records + 32));
         assert!(!heap.made(index) && heap.slot(index).is_none());
         assert_eq!(heap.made.lock().unwrap()[slot as usize], 0);
+    }
+
+    /// With every host block taken, a view in another block waits for one:
+    /// the sync skips it while the title leaves it unchanged (no search of
+    /// the full heap on every visit), and it is made, where shaders find it,
+    /// as soon as a block is given back; a view that went stale meanwhile
+    /// waits no more.
+    #[test]
+    fn a_view_without_a_host_block_waits_for_one() {
+        if host().is_none() {
+            return; // no host GPU
+        }
+        let heap = HostHeap::sized(false, 100_000, 1 << 16).unwrap();
+        let blocks = heap.blocks.as_ref().unwrap();
+        let mut records = vec![[0u32; 8]; 3];
+        let records = records.as_mut_ptr() as u64;
+        for k in [0, 1] {
+            crate::descriptor::create_cbv(
+                std::ptr::null(),
+                &[0x1000 * (k + 1), 1, 256, 0],
+                records + 32 * u64::from(k),
+            );
+        }
+        let bytes = |at: u64| {
+            let mut b = [0u8; 12];
+            // SAFETY: 12 bytes of a record of ours.
+            unsafe { std::ptr::copy_nonoverlapping(at as *const u8, b.as_mut_ptr(), 12) };
+            b
+        };
+        // All 23 host blocks taken.
+        for block in 0..23 {
+            heap.mirror_bytes(block * BLOCK, block * BLOCK + 1, 32, &bytes(records));
+        }
+        let (waiting, other) = (50 * BLOCK + 7, 60 * BLOCK);
+        heap.mirror_bytes(waiting, waiting + 1, 32, &bytes(records + 32));
+        heap.mirror_bytes(other, other + 1, 32, &bytes(records + 32));
+        assert_eq!((heap.slot(waiting), heap.slot(other)), (None, None));
+        let key = {
+            let map = blocks.map.lock().unwrap();
+            assert_eq!((map.free, map.unplaced), (0, 2));
+            map.waiting[waiting as usize]
+        };
+        assert_ne!(key, 0);
+        // Unchanged, it reads as made: the sync passes it by.
+        assert_eq!(heap.prior(&heap.made.lock().unwrap(), waiting), key);
+        // The view at `other` goes stale while it waits.
+        heap.mirror_bytes(other, other + 1, 32, &bytes(records + 64));
+        // The title writes nothing at block 3's view: its host block is
+        // given back and taken by the waiting view's block.
+        let freed = heap.slot(3 * BLOCK).unwrap() / BLOCK;
+        heap.mirror_bytes(3 * BLOCK, 3 * BLOCK + 1, 32, &bytes(records + 64));
+        assert_eq!(heap.slot(waiting), Some(freed * BLOCK + 7));
+        assert!(heap.made(waiting));
+        // SAFETY: a dword of the mapped block table.
+        let entry = unsafe { (blocks.table.1 as *const u32).add(50).read_volatile() };
+        assert_eq!(entry, freed * BLOCK);
+        let map = blocks.map.lock().unwrap();
+        assert_eq!(
+            (map.free, map.unplaced, map.waiting[other as usize]),
+            (0, 0, 0)
+        );
     }
 
     /// A host texture of `format` that allows unordered access, made as
