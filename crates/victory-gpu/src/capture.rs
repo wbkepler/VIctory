@@ -434,6 +434,7 @@ pub(crate) fn read_indirect(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, max): (u32, u32, u32),
     name: String,
+    always: bool,
 ) {
     struct Readback(ID3D12Resource);
     // SAFETY: D3D12 objects are free-threaded.
@@ -488,7 +489,8 @@ pub(crate) fn read_indirect(
         let counted = count.is_some();
         list.defer_after(move || {
             // Recorded ahead: logged if the frame running it is listed.
-            if !listed(crate::queue::presented() + 1) {
+            let frame = crate::queue::presented() + 1;
+            if !always && !listed(frame) {
                 return;
             }
             let mut data = std::ptr::null_mut();
@@ -513,7 +515,7 @@ pub(crate) fn read_indirect(
             let shown: Vec<&[u32]> = (0..records.min(4)).map(first).collect();
             tracing::info!(
                 target: "victory_gpu::trace",
-                "indirect kind {kind} max {max} count {n:?}: {busy} of {records} records with work, {total} in all; first {shown:?} {name}"
+                "indirect kind {kind} max {max} count {n:?}: {busy} of {records} records with work, {total} in all; first {shown:?} {name} frame {frame}"
             );
             buffer.0.Unmap(0, None);
         });

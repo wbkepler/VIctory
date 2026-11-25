@@ -227,12 +227,17 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
 }
 
 /// A format as the host has it. The console's 16-bit depth with stencil
-/// (and its typeless views) has no PC format: the 24-bit ones stand in.
+/// (and its typeless views) has no PC format: the 32-bit float ones stand
+/// in, so that depth its shaders write through unordered views
+/// (`crate::twin`) arrives as the very float a draw rasterises; copied into
+/// 24-bit depth it never tested EQUAL against a draw on the RX 6700 XT.
+/// shortcut: a depth bias on such a target counts in float steps, not
+/// 1/65535; scale it if a title's 16-bit depth biased draws show acne.
 pub(crate) fn pc_format(format: u32) -> u32 {
     match format {
-        118 => 45,
-        119 => 46,
-        120 => 47,
+        118 => 20,
+        119 => 21,
+        120 => 22,
         other => other,
     }
 }
@@ -316,11 +321,11 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    format: u32,
-    width: u32,
-    height: u32,
-    depth: u32,
-    row_pitch: u32,
+    pub(crate) format: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) depth: u32,
+    pub(crate) row_pitch: u32,
 }
 
 impl PlacedFootprint {
@@ -330,6 +335,27 @@ impl PlacedFootprint {
         let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
         let last = u64::from(self.width).div_ceil(block) * element;
         Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
+    }
+
+    /// The byte ranges (from the footprint's start) that a `size` texel
+    /// region at texel `at` covers: one per row of blocks; `None` if the
+    /// format has no size or the region leaves the footprint.
+    pub(crate) fn rows(&self, at: [u32; 3], size: [u32; 3]) -> Option<Vec<(u64, u64)>> {
+        let (element, block) = element(self.format)?;
+        let blocks = |texels: u32| u64::from(texels).div_ceil(block);
+        let [x, y, z] = at.map(u64::from);
+        let (w, h, d) = (blocks(size[0]), blocks(size[1]), u64::from(size[2]));
+        let (x, y) = (x / block, y / block);
+        if x + w > blocks(self.width) || y + h > blocks(self.height) || z + d > u64::from(self.depth) {
+            return None;
+        }
+        let pitch = u64::from(self.row_pitch);
+        let slice = pitch * blocks(self.height);
+        Some(
+            (z..z + d)
+                .flat_map(|k| (y..y + h).map(move |r| (k * slice + r * pitch + x * element, w * element)))
+                .collect(),
+        )
     }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
@@ -1855,6 +1881,17 @@ pub(crate) fn test_buffer(width: u64) -> This {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_regions_rows_in_a_footprint() {
+        // R32_FLOAT (41) 100x8x1, pitch 512.
+        let f = PlacedFootprint { offset: 4096, format: 41, width: 100, height: 8, depth: 1, row_pitch: 512 };
+        assert_eq!(f.rows([2, 3, 0], [10, 2, 1]), Some(vec![(3 * 512 + 8, 40), (4 * 512 + 8, 40)]));
+        assert_eq!(f.rows([95, 0, 0], [10, 1, 1]), None, "past the width");
+        // BC1 (71) 16x16, 8 bytes a 4x4 block, pitch 256: a block row per 4 texel rows.
+        let bc = PlacedFootprint { offset: 0, format: 71, width: 16, height: 16, depth: 1, row_pitch: 256 };
+        assert_eq!(bc.rows([4, 4, 0], [8, 8, 1]), Some(vec![(256 + 8, 16), (2 * 256 + 8, 16)]));
+    }
     use crate::object::slot;
 
     #[test]
@@ -2386,6 +2423,76 @@ mod tests {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
         }
+    }
+
+    /// A texture region copied into a title buffer through our list and
+    /// queue: once the list has run, its rows are in the buffer at the
+    /// footprint's offset and pitch, and nothing else of the buffer moved.
+    #[cfg(windows)]
+    #[test]
+    fn a_texture_read_back_reaches_the_title_buffer() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        const COPY_DEST: u32 = 0x400;
+        let (mut image, mut source, mut target) = (null, null, null);
+        let created = |desc: &ResourceDesc, state, out: &mut This| {
+            assert_eq!(create_committed(null, &PROPERTIES, 0, desc, state, null.cast(), iid, out), S_OK);
+        };
+        created(&texture(4, 4, 28, 1), COPY_DEST, &mut image);
+        created(&buffer(1024), 0, &mut source);
+        created(&buffer(4096), 0, &mut target);
+        let (data, _) = buffer_bytes(source).unwrap();
+        // SAFETY: the buffer holds 1024 bytes.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(data, 1024) };
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let (out, _) = buffer_bytes(target).unwrap();
+        // SAFETY: the buffer holds 4096 bytes.
+        unsafe { std::ptr::write_bytes(out, 0xEE, 4096) };
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &guid(0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]), &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]), &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]), &mut list),
+            S_OK
+        );
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        let rows = PlacedFootprint { offset: 0, format: 28, width: 4, height: 4, depth: 1, row_pitch: 256 };
+        let image_at = Location { resource: image, kind: 0, footprint: rows };
+        let from_source = Location { resource: source, kind: 1, footprint: rows };
+        // Texels (1..3, 1..3) into the target's footprint at 512, at texel (2, 1).
+        let into_target = Location { resource: target, kind: 1, footprint: PlacedFootprint { offset: 512, ..rows } };
+        let region: [u32; 6] = [1, 1, 0, 3, 3, 1];
+        type Copy = extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        let copy = slot::<Copy>(list, 0x80);
+        copy(list, &image_at, 0, 0, 0, &from_source, null.cast());
+        copy(list, &into_target, 2, 1, 0, &image_at, region.as_ptr().cast());
+        slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        // SAFETY: the buffer holds 4096 bytes; the submission has run.
+        let read = unsafe { std::slice::from_raw_parts(out, 4096) };
+        let mut want = vec![0xEEu8; 4096];
+        for row in 0..2 {
+            let (to, from) = (512 + (1 + row) * 256 + 2 * 4, (1 + row) * 256 + 4);
+            want[to..to + 8].copy_from_slice(&bytes[from..from + 8]);
+        }
+        assert!(read == want.as_slice(), "the region's rows, and nothing else");
     }
 
     #[test]
