@@ -682,6 +682,9 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+    /// Buffers shaders wrote, copied at the list's end into read-back
+    /// buffers (from, to, bytes; [`HostList::read_back_at_close`]).
+    read_backs: Vec<(ID3D12Resource, ID3D12Resource, u64)>,
 }
 
 impl Host {
@@ -1389,6 +1392,17 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        for (from, to, bytes) in &self.deferred().read_backs {
+            // SAFETY: an open list; buffers of ours it holds.
+            unsafe {
+                self.list.ResourceBarrier(&[transition(
+                    from,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                self.list.CopyBufferRegion(to, 0, from, 0, *bytes);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -1715,6 +1729,19 @@ impl HostList {
     /// whether its shaders read title memory with no copy.
     pub(crate) fn defer_missed(&self, check: impl Fn() -> bool + Send + 'static) {
         self.deferred().missed.push(Box::new(check));
+    }
+
+    /// At the list's end (when it is closed), `bytes` of `from` (in the
+    /// unordered-access state) are copied into the read-back buffer `to`.
+    pub(crate) fn read_back_at_close(
+        &self,
+        from: &ID3D12Resource,
+        to: &ID3D12Resource,
+        bytes: u64,
+    ) {
+        self.deferred()
+            .read_backs
+            .push((from.clone(), to.clone(), bytes));
     }
 
     /// Runs `work` once the list has run (each submission), before its
@@ -2296,6 +2323,83 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
+                None
+            }
+        }
+    }
+
+    /// A buffer in video memory shaders may write (unordered access), in
+    /// the common state.
+    pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.buffer_in(
+            D3D12_HEAP_TYPE_DEFAULT,
+            size,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        )
+    }
+
+    /// A buffer in the read-back heap, mapped for reading (what the GPU
+    /// copied there, once the submission that copies it has run).
+    pub(crate) fn readback_buffer(&self, size: u64) -> Option<(ID3D12Resource, *const u8)> {
+        let buffer = self.buffer_in(
+            D3D12_HEAP_TYPE_READBACK,
+            size,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )?;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: a read-back buffer of ours, mapped whole.
+        match unsafe { buffer.Map(0, None, Some(&mut data)) } {
+            Ok(()) => Some((buffer, data.cast_const().cast())),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no read-back buffer");
+                None
+            }
+        }
+    }
+
+    fn buffer_in(
+        &self,
+        heap: D3D12_HEAP_TYPE,
+        size: u64,
+        flags: D3D12_RESOURCE_FLAGS,
+        state: D3D12_RESOURCE_STATES,
+    ) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: heap,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                state,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, heap = heap.Type.0, "no buffer");
                 None
             }
         }

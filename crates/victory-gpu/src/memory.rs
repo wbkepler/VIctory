@@ -16,13 +16,20 @@
 //! is brought up to date (page by page, as every refresh; once per
 //! submission until a step writes title memory). Shaders mark the pages
 //! they write in their list's bitmap; after the submission each marked page
-//! goes back into title memory ([`crate::shadow::Shadow::copy_back_page`])
-//! and the bitmap is cleared.
+//! goes back into title memory ([`crate::shadow::Shadow::copy_back_page`]).
+//! The bitmap lives in video memory: the list clears it where it starts
+//! using title memory and copies it into a read-back buffer at its end.
+//! Every write marks a bit atomically, and the lanes of a pass writing one
+//! output region all mark the same few dwords. In system memory (where
+//! the bitmap was) those atomics crossed the bus one after another: lists
+//! of the title's acceleration-structure builds ran for over 2 s, and the
+//! host removed the device.
 //!
 //! Cost per submission with such a list: one change check of every host
 //! copy (the refresh), copies of the pages the title wrote, a compare of
 //! each 64 KiB page shaders wrote, and the table's rewrite when copies came
-//! or went (two views per new copy); per list a bitmap of 256 KiB.
+//! or went (two views per new copy); per list a bitmap of 256 KiB, cleared
+//! and read back by two copies on the GPU.
 //!
 //! Memory no copy holds reads 0 and takes no writes (null views,
 //! bounds-checked); shaders mark such pages (or 256 MiB regions with no
@@ -35,7 +42,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, ID3D12Resource,
+};
 
 use crate::descriptor::host::HostHeap;
 use crate::host::HostList;
@@ -50,6 +59,23 @@ const LEVEL1: usize = 4096;
 const CAPACITY: usize = 512;
 /// The key of our own view heap ([`heap`]) among the title's.
 pub(crate) const OURS: usize = usize::MAX;
+/// A list's page bitmap: a bit per entry of every block a table has room
+/// for, block 0's included.
+const BITMAP_BYTES: u64 = ((CAPACITY + 1) * BLOCK / 8).next_multiple_of(256) as u64;
+
+/// Zeros the bitmaps are cleared from at the start of each run of a list.
+fn zeros() -> Option<ID3D12Resource> {
+    static ZEROS: Mutex<Option<ID3D12Resource>> = Mutex::new(None);
+    let mut zeros = ZEROS.lock().unwrap_or_else(|e| e.into_inner());
+    if zeros.is_none() {
+        let (buffer, data) = crate::host::host()?.upload_buffer(BITMAP_BYTES)?;
+        // SAFETY: our mapped buffer of `BITMAP_BYTES` bytes.
+        unsafe { std::ptr::write_bytes(data, 0, BITMAP_BYTES as usize) };
+        crate::host::name(&buffer, || "title memory bitmap zeros".into());
+        *zeros = Some(buffer);
+    }
+    zeros.clone()
+}
 
 /// A list's use of title memory with a view heap bound.
 pub(crate) struct Map {
@@ -375,22 +401,37 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         Some(gpu)
     })
     .flatten()?;
-    let bits = (CAPACITY + 1) * BLOCK;
-    let (bitmap, data) = crate::host::host()?.shared_buffer((bits / 8).next_multiple_of(256) as u64)?;
+    let words = BITMAP_BYTES as usize / 4;
+    let host = crate::host::host()?;
+    let bitmap = host.uav_buffer(BITMAP_BYTES)?;
     crate::host::name(&bitmap, || "title memory written pages".into());
-    let words = bits / 32;
-    // SAFETY: our mapped buffer of at least `words` dwords.
-    unsafe { std::ptr::write_bytes(data.cast::<u32>(), 0, words) };
+    let (back, data) = host.readback_buffer(BITMAP_BYTES)?;
+    let zeros = zeros()?;
+    // Cleared at the start of each run of the list, read back at its end.
+    // SAFETY: an open list; buffers of ours it holds (the bitmap is in the
+    // common state, which a copy promotes to copy destination).
+    unsafe {
+        list.list
+            .CopyBufferRegion(&bitmap, 0, &zeros, 0, BITMAP_BYTES);
+        list.list.ResourceBarrier(&[crate::host::transition(
+            &bitmap,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        )]);
+    }
+    list.read_back_at_close(&bitmap, &back, BITMAP_BYTES);
     // SAFETY: a live buffer.
     let dirty = unsafe { bitmap.GetGPUVirtualAddress() };
     list.keep(&bitmap);
+    list.keep(&back);
+    list.keep(&zeros);
     list.defer_memory(key);
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
     let data = data as usize;
     list.defer_missed(move || {
         let l = layout(key);
-        // SAFETY: the bitmap is mapped and the list's run is over.
+        // SAFETY: the read-back bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts(data as *const u32, words) };
         marks.iter().enumerate().any(|(w, &mark)| {
             (0..32).filter(|b| mark >> b & 1 != 0).any(|b| {
@@ -402,12 +443,12 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     list.defer_after(move || {
         let Layout { copies, blocks, owner } = &*layout(key);
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: the bitmap is mapped and the list's run is over.
-        let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
+        // SAFETY: the read-back bitmap is mapped and the list's run is over.
+        let marks = unsafe { std::slice::from_raw_parts(data as *const u32, words) };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
         let mut writes = Vec::new();
-        for (w, mark) in marks.iter_mut().enumerate() {
-            let mut bits = std::mem::take(mark);
+        for (w, &mark) in marks.iter().enumerate() {
+            let mut bits = mark;
             while bits != 0 {
                 let entry = w * 32 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
@@ -545,6 +586,15 @@ void main(uint3 id : SV_DispatchThreadID) {
         windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
         windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
     ) {
+        pipeline_of(SOURCE)
+    }
+
+    fn pipeline_of(
+        source: &str,
+    ) -> (
+        windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
+        windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
+    ) {
         use windows::Win32::Graphics::Direct3D::Fxc::{D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, D3DCompile};
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         use windows::Win32::Graphics::Direct3D12::*;
@@ -554,8 +604,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         // SAFETY: the source and names outlive the call; the errors are text.
         unsafe {
             let made = D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 s!("memory"),
                 None,
                 None,
@@ -687,5 +737,99 @@ void main(uint3 id : SV_DispatchThreadID) {
             crate::shadow::unregister(p, p as u64);
             drop(copy);
         }
+    }
+
+    /// Writes 4 dwords of title memory at (`lo`, `hi`) through the page
+    /// table's unordered views, as translated shaders do, marking the page
+    /// in the list's bitmap (`u0, space2`) once per lane.
+    const WRITE: &str = r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors=unbounded)), SRV(t0, space=2), UAV(u0, space=2), RootConstants(num32BitConstants=3, b0)"
+RWByteAddressBuffer views[] : register(u0);
+ByteAddressBuffer table : register(t0, space2);
+RWByteAddressBuffer dirty : register(u0, space2);
+cbuffer c : register(b0) { uint lo; uint hi; uint value; }
+[RootSignature(RS)]
+[numthreads(4, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint a = lo + id.x * 4;
+    uint block = table.Load((hi << 4 | a >> 28) * 4);
+    uint entry = block << 12 | (a >> 16 & 0xFFF);
+    uint2 e = table.Load2((4096 + 2 * entry) * 4);
+    views[NonUniformResourceIndex(e.x + 1)].Store(a - e.y, value + id.x);
+    uint was;
+    dirty.InterlockedOr((entry >> 5) * 4, 1u << (entry & 31), was);
+}
+"#;
+
+    /// A page shaders wrote and marked goes back into title memory after
+    /// each run of the list: the bitmap (in video memory) is cleared where
+    /// the list starts using it and read back at its end, also when the
+    /// closed list runs again after the title rewrote the page.
+    #[test]
+    fn marked_pages_go_back_after_each_run() {
+        use crate::watch::PAGE;
+        let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
+            return; // no host GPU here
+        };
+        let (root, pso) = pipeline_of(WRITE);
+        let p = (0..256u64)
+            .map(|k| 0x48_0000_0000 + (k << 28))
+            // SAFETY: a fresh allocation where nothing is mapped, or none.
+            .map(|hint| unsafe {
+                use windows_sys::Win32::System::Memory::{
+                    MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+                };
+                VirtualAlloc(
+                    hint as *const _,
+                    PAGE,
+                    MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize)
+            .find(|&p| p != 0)
+            .expect("memory below 2^40");
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        let list = host.new_list().unwrap();
+        let map = bind(&list, OURS).expect("a page table");
+        let address = p as u64 + 64;
+        let constants = [address as u32, (address >> 32) as u32, 0x900];
+        // SAFETY: an open list, live objects of ours.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
+            list.list.SetComputeRootShaderResourceView(1, map.table);
+            list.list.SetComputeRootUnorderedAccessView(2, map.dirty);
+            list.list
+                .SetComputeRoot32BitConstants(3, 3, constants.as_ptr().cast(), 0);
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        let read = || -> Vec<u32> {
+            // SAFETY: our title memory, the GPU done with it.
+            unsafe { std::slice::from_raw_parts(address as *const u32, 4).to_vec() }
+        };
+        host.execute(&[&list]);
+        assert_eq!(
+            read(),
+            [0x900, 0x901, 0x902, 0x903],
+            "the marked page went back"
+        );
+        // The title rewrites the dwords; the same closed list runs again
+        // and its shader writes the same values: they go back again.
+        for k in 0..4 {
+            // SAFETY: our title memory.
+            unsafe { (address as *mut u32).add(k).write_volatile(0) };
+        }
+        host.execute(&[&list]);
+        assert_eq!(
+            read(),
+            [0x900, 0x901, 0x902, 0x903],
+            "marked again in the second run"
+        );
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
     }
 }
