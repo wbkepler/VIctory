@@ -849,6 +849,8 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // Lazy copy-backs this thread runs need not wait for the GPU.
+        let _submitting = crate::shadow::lazy::Submitting::enter();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -960,6 +962,8 @@ impl Host {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
+            // No lazy copy-back on another thread while the GPU writes copies.
+            let _gpu = crate::shadow::lazy::gpu_running();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -974,6 +978,7 @@ impl Host {
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
+            drop(_gpu);
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
@@ -2135,6 +2140,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
+    // GPU bytes still only in a copy (lazy copy-back) come first.
+    crate::shadow::lazy::flush_range(src as usize, len, crate::shadow::lazy::Path::HostCopy);
     // The kernel writes the destination: it must not be guarded meanwhile.
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
@@ -2174,6 +2181,13 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
+    // GPU bytes still only in a copy (lazy copy-back) come first.
+    crate::shadow::lazy::flush_range(src as usize, dst.len(), crate::shadow::lazy::Path::HostRead);
+    read(src, dst.as_mut_ptr(), dst.len())
+}
+
+/// [`read_into`] with no lazy copy-back first (under the guard lock).
+pub(crate) fn read_unflushed(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
@@ -2843,6 +2857,8 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
         #[cfg(feature = "diagnostics")]
+        crate::shadow::lazy::frame_done();
+        #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
         }
@@ -2897,6 +2913,7 @@ impl Meter {
             {
                 let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
                 crate::copystat::log(copy_frames);
+                crate::shadow::lazy::log(copy_frames);
                 crate::bindless::log(copy_frames);
                 crate::shadow::log_views(copy_frames);
                 for (why, n) in drops.iter().take(40) {

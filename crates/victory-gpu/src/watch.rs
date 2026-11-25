@@ -108,7 +108,9 @@ impl Changed {
             return;
         }
         let mut bytes = vec![0u8; PAGE].into_boxed_slice();
-        if crate::host::read_into((page * PAGE) as *const u8, &mut bytes) {
+        // Under the guard lock: no lazy copy-back flush from here (the
+        // writes that save a page flushed it first).
+        if crate::host::read_unflushed((page * PAGE) as *const u8, &mut bytes) {
             saved.bytes.insert(page, bytes);
             self.has_saved.store(true, Ordering::Release);
             #[cfg(feature = "diagnostics")]
@@ -251,6 +253,9 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
         return None;
     }
     install();
+    // A new holder takes title memory: GPU bytes still only in a copy
+    // (lazy copy-back) go there first.
+    crate::shadow::lazy::flush_range(start, len, crate::shadow::lazy::Path::Track);
     let end = start + len;
     let pages = start / PAGE..end.div_ceil(PAGE);
     let changed = Arc::new(Changed::new(pages.clone().collect()));
@@ -460,6 +465,69 @@ impl Tracked {
             .remove(&page);
     }
 
+    /// Whether page `page` (a page number) is armed.
+    pub(crate) fn armed(&self, page: usize) -> bool {
+        self.changed
+            .saved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .armed
+            .contains(&page)
+    }
+
+    /// Whether bytes are saved for page `page` (a page number).
+    pub(crate) fn has_saved(&self, page: usize) -> bool {
+        self.changed.has_saved.load(Ordering::Acquire)
+            && self
+                .changed
+                .saved
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .bytes
+                .contains_key(&page)
+    }
+
+    /// Lazy copy-back: hides page `page` (a page number) and every other
+    /// address showing it from the title (no access) while its copy holds
+    /// bytes the GPU wrote that title memory does not have yet. Only when
+    /// this tracker alone holds them and all are guarded (taken), with no
+    /// write the guards do not see under way. `pages`: [`alias_pages`] of
+    /// it, as the caller indexed them. True if hidden.
+    pub(crate) fn hide(&self, page: usize, pages: &[usize]) -> bool {
+        use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY, VirtualProtect};
+        let g = guards();
+        if alias_pages_of(&g, page) != pages {
+            return false;
+        }
+        for &p in pages {
+            if !g.protected.contains(&p) || g.busy.iter().any(|&(a, b)| (a..b).contains(&p)) {
+                return false;
+            }
+            if g
+                .holders
+                .get(&p)
+                .is_some_and(|h| h.iter().any(|c| !Arc::ptr_eq(c, &self.changed)))
+            {
+                return false;
+            }
+        }
+        let set = |p: usize, protection| {
+            let mut old = 0;
+            // SAFETY: title memory we guard; only its protection changes.
+            unsafe { VirtualProtect((p * PAGE) as *const _, PAGE, protection, &mut old) != 0 }
+        };
+        for (i, &p) in pages.iter().enumerate() {
+            if !set(p, PAGE_NOACCESS) {
+                for &q in &pages[..i] {
+                    set(q, PAGE_READONLY);
+                }
+                return false;
+            }
+        }
+        drop(g);
+        true
+    }
+
     /// No shader writes the copy any more: nothing is armed or kept.
     pub(crate) fn disarm(&self) {
         let mut saved = self.changed.saved.lock().unwrap_or_else(|e| e.into_inner());
@@ -480,6 +548,35 @@ impl Tracked {
             self.changed.has_saved.store(false, Ordering::Release);
         }
         out
+    }
+}
+
+/// Page `page` (a page number) and the other pages showing its memory,
+/// sorted.
+pub(crate) fn alias_pages(page: usize) -> Vec<usize> {
+    let g = guards();
+    alias_pages_of(&g, page)
+}
+
+fn alias_pages_of(g: &Guards, page: usize) -> Vec<usize> {
+    let mut pages = vec![page];
+    pages.extend(g.alias_of.get(&page).into_iter().flatten().copied());
+    pages.sort_unstable();
+    pages.dedup();
+    pages
+}
+
+/// Lazy copy-back: pages [`Tracked::hide`] hid are guarded (read-only)
+/// again, those still guarded: their copy-back is about to run.
+pub(crate) fn unhide(pages: &[usize]) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    let g = guards();
+    for &p in pages {
+        if g.protected.contains(&p) {
+            let mut old = 0;
+            // SAFETY: title memory we guard; only its protection changes.
+            unsafe { VirtualProtect((p * PAGE) as *const _, PAGE, PAGE_READONLY, &mut old) };
+        }
     }
 }
 
@@ -636,6 +733,9 @@ impl Drop for Writing {
 pub fn writing(at: usize, len: usize) -> Writing {
     // The length is the title's (`fread`'s size times count, saturated).
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    // GPU bytes only in a copy (lazy copy-back) go into title memory before
+    // the kernel writes it.
+    crate::shadow::lazy::flush_range(at, len, crate::shadow::lazy::Path::KernelWrite);
     let mut g = guards();
     g.busy.push((first, last));
     changed(&mut g, first, last, true);
@@ -646,6 +746,9 @@ pub fn writing(at: usize, len: usize) -> Writing {
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    // Unmapping calls this first, while the memory still shows: GPU bytes
+    // only in a copy (lazy copy-back) go there before it goes.
+    crate::shadow::lazy::flush_range(at, len, crate::shadow::lazy::Path::Remap);
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
     changed(&mut g, first, last, false);
@@ -668,6 +771,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// too (a write through the new mapping must not go unseen by the trackers
 /// there).
 pub fn title_memory_aliased(at: usize, others: &[usize]) {
+    // The new mapping must not show memory the GPU wrote whose bytes are
+    // still only in a copy (lazy copy-back).
+    for &other in others {
+        crate::shadow::lazy::flush_range(other, PAGE, crate::shadow::lazy::Path::Alias);
+    }
     let mut g = guards();
     let page = at / PAGE;
     for &other in others {
@@ -681,6 +789,14 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     if others.iter().any(|&o| g.protected.contains(&(o / PAGE))) {
         protect(&mut g, &[page]);
     }
+}
+
+/// Before the runtime writes title memory `[at, at + len)` some other way
+/// than through its addresses (DirectStorage writing physical pages through
+/// views of its own): GPU bytes still only in a copy (lazy copy-back) go
+/// there first.
+pub fn flush_gpu_writes(at: usize, len: usize) {
+    crate::shadow::lazy::flush_range(at, len, crate::shadow::lazy::Path::Physical);
 }
 
 /// Ensures the vectored exception handler is installed (also used to recover
@@ -714,6 +830,22 @@ fn install() {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         const WRITE: usize = 1;
+        // Lazy copy-back: a read or write of a page hidden while its copy
+        // holds the GPU's bytes brings them first, then runs again.
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && r.ExceptionInformation[0] <= WRITE
+            && crate::shadow::lazy::on()
+        {
+            let at = r.ExceptionInformation[1];
+            if crate::shadow::lazy::fault(at) {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            // A read of a page another thread brought back meanwhile.
+            if r.ExceptionInformation[0] != WRITE && readable(at) {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
             || r.ExceptionInformation[0] != WRITE
@@ -755,6 +887,21 @@ fn writable(at: usize) -> bool {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+}
+
+/// Whether `at` is committed memory readable now.
+fn readable(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+        PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0
+        && info.State == MEM_COMMIT
+        && [PAGE_READONLY, PAGE_READWRITE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE].contains(&info.Protect)
 }
 
 /// Adds the time since it was made to a counter when dropped (diagnostics).
