@@ -3335,12 +3335,12 @@ impl Host {
     }
 
     /// Whether host copies that shaders only read go to GPU upload heaps:
-    /// `VICTORY_GPU_UPLOAD=1` (a prototype, off by default) and a host that
-    /// has them. Asked once.
+    /// `VICTORY_GPU_UPLOAD` (on unless `0`) and a host that has them. Asked
+    /// once.
     pub(crate) fn gpu_upload(&self) -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| {
-            if !crate::switch::on("VICTORY_GPU_UPLOAD") {
+            if !crate::switch::on_by_default("VICTORY_GPU_UPLOAD") {
                 return false;
             }
             let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
@@ -3364,11 +3364,13 @@ impl Host {
 
     /// Whether host copies that shaders write go to GPU upload heaps too,
     /// with a system memory mirror for the CPU (`crate::shadow`):
-    /// `VICTORY_GPU_UPLOAD_WRITES=1` with [`Host::gpu_upload`] on. Asked once.
+    /// `VICTORY_GPU_UPLOAD_WRITES` (on unless `0`) with [`Host::gpu_upload`]
+    /// on. Asked once.
     pub(crate) fn gpu_upload_writes(&self) -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| {
-            let on = self.gpu_upload() && crate::switch::on("VICTORY_GPU_UPLOAD_WRITES");
+            let on =
+                self.gpu_upload() && crate::switch::on_by_default("VICTORY_GPU_UPLOAD_WRITES");
             tracing::info!(
                 on,
                 "host copies that shaders write in GPU upload heaps (VICTORY_GPU_UPLOAD_WRITES)"
