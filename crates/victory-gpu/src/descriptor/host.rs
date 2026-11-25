@@ -1352,14 +1352,26 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        if typeless {
+            return false;
+        }
+        // An unordered view in a format the host cannot store removes the
+        // device (B5G5R5A1_UNORM on NVIDIA, #1753).
+        if unordered && !typed_store(own) {
+            once!(own, "an unordered view in a format the host cannot store");
+            return false;
+        }
+        return true;
     }
     let cast = castable.contains(&view);
     if family(view) != family(own) && !cast {
         once!(view, own, "view format of another family");
         return false;
     }
-    if cast && family(view) != family(own) && unordered && !typed_store(view) {
+    // The format the view is made in: the texture's own, below, for a view
+    // in another format of a typed texture's family it is not castable to.
+    let made = if !typeless && !cast { own } else { view };
+    if unordered && !typed_store(made) {
         once!(view, own, "an unordered view in a format the host cannot store");
         return false;
     }
@@ -1975,6 +1987,80 @@ mod tests {
         assert!(heap.slot(22 * BLOCK).is_none() && heap.slot(20 * BLOCK).is_some());
         assert!(heap.mirror(22 * BLOCK, handle(0), false).is_none());
         assert_eq!(shader(22 * BLOCK), null);
+    }
+
+    /// A host texture of `format` that allows unordered access, made as
+    /// `resource::host_texture` makes it (castable to its element size's
+    /// formats where the host takes that), and those formats.
+    fn unordered_texture(format: u32) -> Option<(ID3D12Resource, Vec<u32>)> {
+        use windows::core::Interface;
+        let device = &host()?.device;
+        let desc = D3D12_RESOURCE_DESC1 {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT(format as i32),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let castable = crate::resource::castable(format);
+        let formats: Vec<DXGI_FORMAT> = castable.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain object creation; the list lives through the call.
+        unsafe {
+            device
+                .cast::<ID3D12Device10>()
+                .ok()?
+                .CreateCommittedResource3(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_BARRIER_LAYOUT_COMMON,
+                    None,
+                    None::<&ID3D12ProtectedResourceSession>,
+                    Some(&formats),
+                    &mut texture,
+                )
+                .ok()?;
+        }
+        Some((texture?, castable))
+    }
+
+    /// An unordered view is made only in a format the host can store, in
+    /// the texture's own format too: B5G5R5A1_UNORM has none on NVIDIA, and
+    /// making one removed the device at boot (#1753).
+    #[test]
+    fn unordered_views_only_in_formats_the_host_stores() {
+        const B5G5R5A1_UNORM: u32 = 86;
+        const R8G8B8A8_UNORM: u32 = 28;
+        let Some((stored, castable)) = unordered_texture(R8G8B8A8_UNORM) else {
+            return; // no host GPU
+        };
+        assert!(typed_store(R8G8B8A8_UNORM));
+        assert!(fits(&stored, &castable, None, true));
+        let mut own = DXGI_FORMAT(R8G8B8A8_UNORM as i32);
+        assert!(fits(&stored, &castable, Some(&mut own), true));
+        // The host may refuse such a texture outright; where it makes one,
+        // its views follow the host's typed store support.
+        let Some((texture, castable)) = unordered_texture(B5G5R5A1_UNORM) else {
+            return;
+        };
+        let stores = typed_store(B5G5R5A1_UNORM);
+        assert_eq!(fits(&texture, &castable, None, true), stores);
+        let mut own = DXGI_FORMAT(B5G5R5A1_UNORM as i32);
+        assert_eq!(fits(&texture, &castable, Some(&mut own), true), stores);
+        // Shader views are not affected.
+        assert!(fits(&texture, &castable, None, false));
     }
 
     #[test]
