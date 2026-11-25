@@ -62,15 +62,23 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
-/// The first adapter that is a GPU: not flagged software, and with video
-/// memory of its own. A machine without one (GitHub's Windows runner has only
-/// `Microsoft Basic Render Driver`) has nothing to run the hardware-only
-/// checks on, and CI proved that the flag of adapter 0 alone is not enough:
-/// the runner's default adapter is not flagged software and its device still
-/// refuses a wave of 32
-/// (`permutes_read_the_lane_named_and_zero_from_lanes_left_out`). WARP and the
-/// basic render driver report no dedicated video memory, which is what this
-/// asks for as well.
+/// Whether an adapter is a GPU. A machine without one (a CI runner; GitHub's
+/// Windows runner has only `Microsoft Basic Render Driver`) can list that
+/// driver, which is WARP, as an ordinary adapter without the software flag:
+/// its ids, or its name, tell. CI proved the flag alone is not enough (the
+/// runner's default adapter still refuses a wave of 32,
+/// `permutes_read_the_lane_named_and_zero_from_lanes_left_out`); WARP and the
+/// basic render driver also report no dedicated video memory.
+fn hardware(d: &DXGI_ADAPTER_DESC1) -> bool {
+    let basic_render_driver = d.VendorId == 0x1414 && d.DeviceId == 0x8c
+        || description(&d.Description) == "Microsoft Basic Render Driver";
+    d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0
+        && !basic_render_driver
+        && d.DedicatedVideoMemory > 0
+}
+
+/// The first adapter that is a GPU ([`hardware`]), so hardware-only checks
+/// never run on WARP.
 fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapter1> {
     // SAFETY: plain DXGI adapter enumeration.
     unsafe {
@@ -78,9 +86,7 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
             let Ok(adapter) = factory.EnumAdapters1(index) else {
                 break;
             };
-            let desc = adapter.GetDesc1()?;
-            let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
-            if !software && desc.DedicatedVideoMemory > 0 {
+            if hardware(&adapter.GetDesc1()?) {
                 return Ok(adapter);
             }
         }
@@ -91,21 +97,90 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
     ))
 }
 
+/// The hardware adapters that run waves of 32 or 64 lanes, in DXGI's
+/// order: each one's description. An integrated GPU with narrower waves
+/// (some Intel ones report 16-16) runs none of the console's programs
+/// that depend on the wave size: the translator refuses them for it by
+/// name, and what walks this list expects a pipeline. An adapter no SM 6.6
+/// device can be made on stays listed, for its user to skip.
+pub fn adapters() -> Result<Vec<String>, String> {
+    // SAFETY: plain DXGI calls.
+    let mut out = unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(err)?;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while let Ok(a) = factory.EnumAdapters1(i) {
+            let d = a.GetDesc1().map_err(err)?;
+            if hardware(&d) {
+                out.push(description(&d.Description));
+            }
+            i += 1;
+        }
+        out
+    };
+    out.retain(|name| {
+        Host::on(name).map_or(true, |host| {
+            let target = host.target();
+            target.runs(32) || target.runs(64)
+        })
+    });
+    Ok(out)
+}
+
+fn description(wide: &[u16]) -> String {
+    let n = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+    String::from_utf16_lossy(&wide[..n])
+}
+
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
-    /// A software default adapter (a machine without a GPU, as CI) is
-    /// refused, so hardware-only checks never run on WARP.
+    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`), or
+    /// the first hardware adapter whose description holds
+    /// `VICTORY_ADAPTER` (ignoring case: `nvidia`, `radeon`...).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        match std::env::var("VICTORY_ADAPTER") {
+            Ok(name) if !warp && !name.is_empty() => Self::on(&name),
+            _ => Self::create(warp, None),
+        }
+    }
+
+    /// The first hardware adapter whose description holds `name`,
+    /// ignoring case.
+    pub fn on(name: &str) -> Result<Self, String> {
+        let want = name.to_lowercase();
+        // SAFETY: plain DXGI calls.
+        let adapter = unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(err)?;
+            let mut i = 0;
+            loop {
+                let a = factory
+                    .EnumAdapters1(i)
+                    .map_err(|_| format!("no adapter named {name:?}"))?;
+                let d = a.GetDesc1().map_err(err)?;
+                if hardware(&d) && description(&d.Description).to_lowercase().contains(&want) {
+                    break a;
+                }
+                i += 1;
+            }
+        };
+        Self::create(false, Some(adapter.cast().map_err(err)?))
+    }
+
+    fn create(warp: bool, adapter: Option<IDXGIAdapter>) -> Result<Self, String> {
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             let mut device: Option<ID3D12Device> = None;
             let factory: IDXGIFactory4 =
                 CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-            let adapter: IDXGIAdapter1 = if warp {
+            let adapter: IDXGIAdapter = if warp {
                 factory.EnumWarpAdapter().map_err(err)?
+            } else if let Some(adapter) = adapter {
+                adapter
             } else {
-                hardware_adapter(&factory).map_err(err)?
+                hardware_adapter(&factory)
+                    .map_err(err)?
+                    .cast()
+                    .map_err(err)?
             };
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             let device = device.ok_or("no device")?;
@@ -126,6 +201,30 @@ impl Host {
                 ));
             }
             Ok(Host { device })
+        }
+    }
+
+    /// The wave sizes the device runs ([`super::Target::ANY`] if it does
+    /// not say).
+    pub fn target(&self) -> super::Target {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the query writes the structure of the given size.
+        let ok = unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut o).cast(),
+                    size_of_val(&o) as u32,
+                )
+                .is_ok()
+        };
+        if ok && o.WaveOps.as_bool() && o.WaveLaneCountMin > 0 {
+            super::Target {
+                lanes_min: o.WaveLaneCountMin,
+                lanes_max: o.WaveLaneCountMax,
+            }
+        } else {
+            super::Target::ANY
         }
     }
 
@@ -741,6 +840,9 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,

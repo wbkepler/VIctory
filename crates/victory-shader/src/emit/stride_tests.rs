@@ -194,6 +194,9 @@ fn build(
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
     })
     .expect("lower");
     let shader = HostShader {

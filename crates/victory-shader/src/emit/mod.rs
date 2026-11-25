@@ -2,7 +2,9 @@
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
-//! size (`WaveSize`), so the host device must support it.
+//! size (`WaveSize`), so the host device must support it: [`Target`] says
+//! which wave sizes the host runs, and a shader that needs another one does
+//! not translate for it (rather than being refused at pipeline creation).
 //!
 //! What the host binds for a translated shader ([`HostShader`]):
 //!
@@ -207,6 +209,8 @@ mod diff_tests;
 mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod lane_read_loop_tests;
 mod lower;
 mod rect;
 pub use rect::rectangle_gs;
@@ -216,6 +220,8 @@ mod sampler;
 #[cfg(all(test, windows))]
 mod semantics_tests;
 mod shader;
+#[cfg(all(test, windows))]
+mod split_tests;
 #[cfg(all(test, windows))]
 mod stride_tests;
 #[cfg(all(test, windows))]
@@ -366,6 +372,52 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// The wave sizes (lanes per wave) the host GPU runs, as D3D12 reports them
+/// (`D3D12_FEATURE_DATA_D3D12_OPTIONS1::WaveLaneCountMin` / `Max`). A
+/// compute shader that declares the console's wave size translates only
+/// for a host whose range holds it: NVIDIA's range is 32..32, so a console
+/// wave64 program that reads other lanes needs 64-lane waves it cannot get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Target {
+    pub lanes_min: u32,
+    pub lanes_max: u32,
+}
+
+impl Target {
+    /// No limit known: every wave size is taken to run (the host refuses
+    /// a pipeline it cannot run).
+    pub const ANY: Target = Target {
+        lanes_min: 4,
+        lanes_max: 128,
+    };
+
+    /// Whether the host runs waves of `lanes`.
+    pub fn runs(self, lanes: u32) -> bool {
+        (self.lanes_min..=self.lanes_max).contains(&lanes)
+    }
+
+    /// The range as bytes, for cache keys.
+    pub fn key(self) -> [u8; 8] {
+        let mut k = [0; 8];
+        k[..4].copy_from_slice(&self.lanes_min.to_le_bytes());
+        k[4..].copy_from_slice(&self.lanes_max.to_le_bytes());
+        k
+    }
+}
+
+impl Default for Target {
+    fn default() -> Self {
+        Target::ANY
+    }
+}
+
+/// A diagnostic: what the module this thread emitted last declares and
+/// calls (thread-group size, wave size, `dx.op` operations), for reports of
+/// a module the validator refuses. Nothing of the console program is in it.
+pub fn last_module_summary() -> String {
+    shader::last_summary()
+}
+
 /// How a translation is made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Options {
@@ -373,12 +425,25 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
+    /// The wave sizes the host runs ([`Target::ANY`] by default).
+    pub target: Target,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container, without write marks.
+/// shader container, for any host ([`Target::ANY`]), without write marks.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     translate_with(container, Options::default())
+}
+
+/// [`translate`] for a host that runs the wave sizes of `target`.
+pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, ShaderError> {
+    translate_with(
+        container,
+        Options {
+            target,
+            ..Options::default()
+        },
+    )
 }
 
 /// [`translate`] made as `options` say.
@@ -409,7 +474,8 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     emit_with(&c, &native, &p, &st, &io, &res, options)
 }
 
-/// Emits a program whose earlier stages already ran, without write marks.
+/// Emits a program whose earlier stages already ran, for `target`, without
+/// write marks.
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -417,8 +483,20 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+    target: Target,
 ) -> Result<HostShader, ShaderError> {
-    emit_with(c, native, p, st, io, res, Options::default())
+    emit_with(
+        c,
+        native,
+        p,
+        st,
+        io,
+        res,
+        Options {
+            target,
+            ..Options::default()
+        },
+    )
 }
 
 /// [`emit`] made as `options` say.
@@ -497,8 +575,37 @@ pub fn emit_with(
         prims: prims.clone(),
         mesh_stride,
         view_marks: options.view_marks,
+        target: options.target,
+        console_cf: false,
+        per_lane_only: false,
     };
     let l = match lower::lower(&parts(st, res)) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
+            let console = structure::structure_console(p);
+            let lowered = match &console {
+                Ok(console) => lower::lower(&lower::Parts {
+                    console_cf: true,
+                    ..parts(console, res)
+                }),
+                Err(e) => Err(ShaderError::Unsupported {
+                    offset: 0,
+                    what: match e {
+                        ShaderError::Unsupported { what, .. } => what,
+                        _ => "a program the console structure cannot hold",
+                    },
+                }),
+            };
+            match lowered {
+                Ok(l) => l,
+                // What the console flow cannot lower keeps the per-lane form
+                // where that translates; else the console flow's reason.
+                Err(e) => lower::lower(&lower::Parts {
+                    per_lane_only: true,
+                    ..parts(st, res)
+                })
+                .map_err(|_| e)?,
+            }
+        }
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
@@ -631,6 +738,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
+    use super::Target;
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
@@ -698,7 +806,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
-        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res, Target::ANY).unwrap();
         // dxil.dll, where there is one, checks the flags against the module.
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
@@ -788,7 +896,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
-        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res, Target::ANY).unwrap();
 
         let sampler = StaticSampler::from_words([0; 4]);
         let comparison = StaticSampler {
@@ -834,7 +942,7 @@ mod tests {
         let io = io::raise(&p, &native).unwrap();
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
-        if let Err(e) = emit(&c, &native, &p, &st, &io, &res) {
+        if let Err(e) = emit(&c, &native, &p, &st, &io, &res, Target::ANY) {
             assert!(e.to_string().contains("its own value"), "{e}");
         }
     }
@@ -1020,7 +1128,7 @@ mod tests {
         let st = structure::structure(&p)?;
         let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
         let io = io::raise(&p, &native)?;
-        emit(&c, &native, &p, &st, &io, &res)
+        emit(&c, &native, &p, &st, &io, &res, Target::ANY)
     }
 
     /// A primitive export's corners are 9-bit indices: the edge flag above
@@ -1187,7 +1295,7 @@ mod tests {
             let st = crate::structure::structure(&p).unwrap();
             let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = crate::io::raise(&p, &native).unwrap();
-            let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+            let out = super::emit(&c, &native, &p, &st, &io, &res, super::Target::ANY).unwrap();
             // dxil.dll, where there is one, checks PSV0 against the module.
             #[cfg(windows)]
             if let Ok(mut v) = super::validator::Validator::load(
@@ -1233,7 +1341,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native)?;
-        let out = emit(&c, &native, &p, &st, &io, &res)?;
+        let out = emit(&c, &native, &p, &st, &io, &res, Target::ANY)?;
         // dxil.dll, where there is one, checks the module.
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
@@ -1540,7 +1648,7 @@ mod tests {
             let st = crate::structure::structure(&p).unwrap();
             let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = crate::io::raise(&p, &native).unwrap();
-            super::emit(&c, &native, &p, &st, &io, &res).unwrap().dxil
+            super::emit(&c, &native, &p, &st, &io, &res, Target::ANY).unwrap().dxil
         };
         let (Some(low), Some(high)) = (
             dump_dxil(&dump(false, 0, false)),
@@ -1614,6 +1722,158 @@ mod tests {
         let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
-        let _ = super::emit(&c, &native, &p, &st, &io, &res);
+        let _ = super::emit(&c, &native, &p, &st, &io, &res, Target::ANY);
+    }
+
+    /// A compute program of 64 threads in one group: `words` as GFX10 code.
+    pub(super) fn compute(words: &[u32], wave64: bool) -> crate::NativeProgram {
+        compute_of(words, wave64, 64)
+    }
+
+    /// [`compute`] with `threads` threads in the group.
+    pub(super) fn compute_of(words: &[u32], wave64: bool, threads: u32) -> crate::NativeProgram {
+        crate::NativeProgram {
+            stage: crate::HwStage::Cs,
+            wave64,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 0,
+                threads: [threads, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        }
+    }
+
+    pub(super) fn emit_for(
+        native: &crate::NativeProgram,
+        target: Target,
+    ) -> Result<super::HostShader, crate::ShaderError> {
+        let c = crate::Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: vec![],
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs)?;
+        let st = crate::structure::structure(&p);
+        let res = crate::resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+        let io = crate::io::raise(&p, native)?;
+        let st = st?;
+        super::emit(&c, native, &p, &st, &io, &res, target)
+    }
+
+    const NVIDIA: Target = Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    const RDNA: Target = Target {
+        lanes_min: 32,
+        lanes_max: 64,
+    };
+
+    #[test]
+    fn console_lanes_translate_only_for_hosts_with_that_wave_size() {
+        let words = [
+            0xD760_0000,
+            0x0001_0B00, // v_readlane_b32 s0, v0, 5
+            0x7E02_0200, // v_mov_b32 v1, s0
+            0xBF81_0000, // s_endpgm
+        ];
+        // One console wave per group: in the console flow on NVIDIA.
+        let wave64 = compute(&words, true);
+        assert!(emit_for(&wave64, Target::ANY).is_ok());
+        assert!(emit_for(&wave64, RDNA).is_ok());
+        assert!(emit_for(&wave64, NVIDIA).is_ok());
+        // Two per group: the halves cannot meet at a group barrier yet.
+        let two = compute_of(&words, true, 128);
+        assert!(emit_for(&two, RDNA).is_ok());
+        assert_eq!(
+            emit_for(&two, NVIDIA),
+            Err(crate::ShaderError::Unsupported {
+                offset: 0,
+                what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
+            })
+        );
+        // The same code in waves of 32 runs on either.
+        let wave32 = compute(&words, false);
+        assert!(emit_for(&wave32, NVIDIA).is_ok());
+        assert!(emit_for(&wave32, RDNA).is_ok());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn what_translates_for_the_host_creates_a_pipeline() {
+        let Ok(host) = super::host::Host::new(false) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return;
+        };
+        let target = host.target();
+        eprintln!("host waves {}-{}", target.lanes_min, target.lanes_max);
+        let words = [0xD760_0000, 0x0001_0B00, 0x7E02_0200, 0xBF81_0000];
+        for wave64 in [false, true] {
+            match emit_for(&compute_of(&words, wave64, 128), target) {
+                Ok(cs) => {
+                    if let Err(e) = host.compute_pipeline(&cs) {
+                        panic!("wave64 {wave64}: translated for the host, refused by it: {e}");
+                    }
+                }
+                Err(e) => {
+                    // The host has no waves of the program's size. (The
+                    // software adapter of a machine without a GPU has
+                    // 4-lane waves: not the wave32 program either.)
+                    let wave = if wave64 { 64 } else { 32 };
+                    assert!(!target.runs(wave), "{e}");
+                    // What it replaces: the host refuses the console's
+                    // wave size at pipeline creation.
+                    let any = emit_for(&compute_of(&words, wave64, 128), Target::ANY).unwrap();
+                    assert!(host.compute_pipeline(&any).is_err());
+                }
+            }
+        }
+    }
+
+    /// On every hardware adapter: a wave64 program that reads other lanes
+    /// translates in groups of one console wave (natively or in the console
+    /// flow) and the adapter takes it; in groups of two it translates
+    /// exactly when the adapter runs 64-lane waves. On a machine with an AMD
+    /// and an NVIDIA GPU this checks both answers.
+    #[test]
+    #[cfg(windows)]
+    fn each_adapter_gets_what_it_runs() {
+        let Ok(names) = super::host::adapters() else {
+            eprintln!("no DXGI; skipped");
+            return;
+        };
+        let words = [0xD760_0000, 0x0001_0B00, 0x7E02_0200, 0xBF81_0000];
+        for name in names {
+            let Ok(host) = super::host::Host::on(&name) else {
+                eprintln!("{name}: no SM 6.6 device; skipped");
+                continue;
+            };
+            let target = host.target();
+            eprintln!("{name}: waves {}-{}", target.lanes_min, target.lanes_max);
+            let one =
+                emit_for(&compute(&words, true), target).unwrap_or_else(|e| panic!("{name}: {e}"));
+            host.compute_pipeline(&one)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            match emit_for(&compute_of(&words, true, 128), target) {
+                Ok(cs) => {
+                    assert!(target.runs(64), "{name}");
+                    host.compute_pipeline(&cs)
+                        .unwrap_or_else(|e| panic!("{name}: {e}"));
+                }
+                Err(_) => assert!(!target.runs(64), "{name}"),
+            }
+        }
+    }
+
+    #[test]
+    fn programs_reading_no_other_lanes_translate_for_any_wave_size() {
+        let words = [
+            0x7E02_0300, // v_mov_b32 v1, v0
+            0xBF81_0000, // s_endpgm
+        ];
+        assert!(emit_for(&compute(&words, true), NVIDIA).is_ok());
     }
 }
