@@ -56,13 +56,17 @@ pub(crate) struct Heap {
     /// descriptor order when a draw first uses them (decision 0007, step
     /// 3); slots written before wait in `pending`.
     #[cfg(windows)]
-    host: std::sync::OnceLock<Option<host::HostHeap>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<host::HostHeap>>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
     /// A shader-visible heap in the title's memory, tracked: the title also
     /// copies descriptors into it itself, as bytes (`sync_heaps`).
     #[cfg(windows)]
     written: Option<crate::watch::Tracked>,
+    /// Flipped to `false` under `SHADER_HEAPS` when the heap drops so an
+    /// in-flight `sync_heaps` pass stops before touching freed pages.
+    #[cfg(windows)]
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub(crate) use host::fallback_samplers;
@@ -85,7 +89,7 @@ impl Heap {
     #[cfg(windows)]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
         if let Some(h) = self.host.get() {
-            return h.as_ref();
+            return h.as_deref();
         }
         if self.desc.flags & SHADER_VISIBLE == 0 || !matches!(self.desc.kind, VIEWS_KIND | SAMPLERS)
         {
@@ -101,9 +105,9 @@ impl Heap {
                 for i in pending.drain(..) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
-                Some(h)
+                Some(std::sync::Arc::new(h))
             })
-            .as_ref()
+            .as_deref()
     }
 
     /// The descriptor index of `handle` in this heap, if it lies in it.
@@ -163,29 +167,108 @@ fn mirror(handle: u64) {
 /// heap at indices in their data, where a slot never mirrored reads nothing.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
-    // Held throughout: a heap is not dropped while its slots are made.
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    for &(start, _, at) in heaps.iter() {
-        // SAFETY: registered heaps are live (removed when dropped).
-        let heap = unsafe { &*(at as *const Heap) };
-        let (Some(Some(host)), Some(written), Some(step)) =
-            (heap.host.get(), &heap.written, increment(heap.desc.kind))
-        else {
-            continue;
-        };
-        let step = u64::from(step);
-        for (from, to) in written.take(start as usize, usize::MAX) {
-            // By page: one with nothing mapped (the title unmaps heap pages
-            // too) holds no records.
+    sync_heaps_with(
+        |heap| heap.host.get()?.as_ref().map(std::sync::Arc::clone),
+        |host, first, last, step, bytes| host.mirror_bytes(first, last, step, bytes),
+    );
+}
+
+/// Collects dirty ranges under `SHADER_HEAPS`, drops the lock, safely copies
+/// readable title memory into a reusable scratch buffer via `read_into`, and
+/// mirrors each readable run via `mirror_bytes` without blocking parallel
+/// recorders or dereferencing unvalidated title pointers.
+#[cfg(windows)]
+fn sync_heaps_with<H>(
+    mut host_of: impl FnMut(&Heap) -> Option<H>,
+    mut mirror_bytes: impl FnMut(&H, u32, u32, u64, &[u8]),
+) {
+    use std::sync::atomic::Ordering;
+    let pending: Vec<_> = {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        heaps.iter().filter_map(|&(start, _, at)| {
+            // SAFETY: registered heaps are live (removed when dropped, which
+            // waits for the `SHADER_HEAPS` lock we hold).
+            let heap = unsafe { &*(at as *const Heap) };
+            let (host, written, step) =
+                (host_of(heap)?, heap.written.as_ref()?, u64::from(increment(heap.desc.kind)?));
+            let dirty = written.take(start as usize, usize::MAX);
+            (!dirty.is_empty()).then_some((
+                host,
+                std::sync::Arc::clone(&heap.alive),
+                dirty,
+                start,
+                step,
+                heap.desc.count,
+            ))
+        }).collect()
+    };
+    const OS_PAGE: u64 = 4096;
+    const SLOT_HEADER: u64 = 12;
+    let mut scratch = Vec::new();
+    for (host, alive, dirty, start, step, count) in pending {
+        let count = u64::from(count);
+        'heap: for (from, to) in dirty {
+            // By 64 KiB watch page: read the full slot span once via safe
+            // `read_into`, falling back to 4 KiB OS pages (and per-slot 12-byte
+            // reads across 4 KiB boundaries) if part of the page was decommitted
+            // or an unaligned heap straddles an unmapped boundary.
             let page_size = crate::watch::PAGE;
             for page in (from & !(page_size - 1)..to).step_by(page_size) {
+                if !alive.load(Ordering::Acquire) {
+                    break 'heap;
+                }
                 let (page, end) = (page.max(from), (page + page_size).min(to));
-                if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
+                let first = (page as u64 - start) / step;
+                let last = (end as u64 - start).div_ceil(step).min(count);
+                if first >= last {
                     continue;
                 }
-                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
-                for index in first..last.min(u64::from(heap.desc.count)) {
-                    host.mirror(index as u32, start + index * step, false);
+                let span_start = start + first * step;
+                let span_len = ((last - 1 - first) * step + SLOT_HEADER) as usize;
+                if scratch.len() < span_len {
+                    scratch.resize(span_len, 0);
+                }
+                if crate::host::read_into(span_start as *const u8, &mut scratch[..span_len]) {
+                    if !alive.load(Ordering::Acquire) {
+                        break 'heap;
+                    }
+                    mirror_bytes(&host, first as u32, last as u32, step, &scratch[..span_len]);
+                    continue;
+                }
+                let mut idx = first;
+                while idx < last {
+                    if !alive.load(Ordering::Acquire) {
+                        break 'heap;
+                    }
+                    let addr = start + idx * step;
+                    let os_end = (addr & !(OS_PAGE - 1)) + OS_PAGE;
+                    let mut sub_end = idx;
+                    while sub_end < last && start + sub_end * step + SLOT_HEADER <= os_end {
+                        sub_end += 1;
+                    }
+                    if sub_end > idx {
+                        let sub_len = ((sub_end - 1 - idx) * step + SLOT_HEADER) as usize;
+                        if crate::host::read_into(addr as *const u8, &mut scratch[..sub_len])
+                            && alive.load(Ordering::Acquire)
+                        {
+                            mirror_bytes(
+                                &host,
+                                idx as u32,
+                                sub_end as u32,
+                                step,
+                                &scratch[..sub_len],
+                            );
+                        }
+                        idx = sub_end;
+                    } else {
+                        let mut one = [0u8; SLOT_HEADER as usize];
+                        if crate::host::read_into(addr as *const u8, &mut one)
+                            && alive.load(Ordering::Acquire)
+                        {
+                            mirror_bytes(&host, idx as u32, (idx + 1) as u32, step, &one);
+                        }
+                        idx += 1;
+                    }
                 }
             }
         }
@@ -215,7 +298,7 @@ pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) ->
     }
     // SAFETY: registered heaps are live (removed when dropped, which waits
     // for the lock we hold).
-    let host = unsafe { &*(heap as *const Heap) }.host.get()?.as_ref()?;
+    let host = unsafe { &*(heap as *const Heap) }.host.get()?.as_deref()?;
     Some(f(host))
 }
 
@@ -224,6 +307,7 @@ impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        self.alive.store(false, std::sync::atomic::Ordering::Release);
         heaps.retain(|&(_, _, h)| h != at);
     }
 }
@@ -445,12 +529,26 @@ pub(crate) fn forget(resource: usize) {
     }
 }
 
+#[cfg(windows)]
+impl Views {
+    fn matches(&self, i: u32, generation: u32) -> bool {
+        self.list.get(i as usize).is_some_and(|&(_, cur)| cur == generation)
+    }
+    fn get(&self, i: u32, generation: u32) -> Option<&View> {
+        self.list.get(i as usize).and_then(|(v, cur)| (*cur == generation).then_some(v))
+    }
+}
+
+/// Runs `f` with the view table locked once.
+#[cfg(windows)]
+fn with_views<R>(f: impl FnOnce(&Views) -> R) -> R {
+    f(&VIEWS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// The view of entry `i` if `generation` is still its own.
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+    with_views(|views| views.get(i, generation).cloned())
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -675,6 +773,8 @@ pub(crate) extern "system" fn create_heap(
         written: (placed && visible)
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
+        #[cfg(windows)]
+        alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     });
     #[cfg(windows)]
     if visible {
@@ -843,6 +943,130 @@ mod tests {
             assert!(host.made(5), "made at the sync");
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        crate::watch::tests::free(memory);
+    }
+
+    /// Dirty-page sync drops `SHADER_HEAPS` before scanning pages so concurrent
+    /// `with_host` / `release_dynamic` calls do not block, and repeat scans
+    /// emit zero updates.
+    #[cfg(windows)]
+    #[test]
+    fn dirty_page_sync_leaves_shader_heaps_unlocked_and_skips_unchanged() {
+        let (memory, per_page) = (crate::watch::tests::pool(2), (crate::watch::PAGE / 32) as u32);
+        let (count, mut h) = (per_page * 2, std::ptr::null());
+        let desc = HeapDesc { kind: VIEWS_KIND, count, flags: SHADER_VISIBLE, nodes: 1 };
+        assert_eq!(create(desc, Placement { address: memory as u64, size: u64::from(count) * 32 }, &mut h), S_OK);
+        let (heap_key, mut scratch, targets) = (h as usize, [0u64; 4], [3u32, per_page + 7]);
+        create_cbv(std::ptr::null(), &[0x2000, 0, 256, 0], scratch.as_mut_ptr() as u64);
+        for slot_i in targets {
+            // SAFETY: 32 bytes inside `scratch` and our 2-page pool allocation.
+            unsafe { std::ptr::copy_nonoverlapping(scratch.as_ptr().cast(), (memory as u64 + u64::from(slot_i) * 32) as *mut u8, 32) };
+        }
+        let (mut made, mut pages, mut updated) = (vec![0u64; count as usize], 0usize, Vec::new());
+        let only_ours = |hp: &Heap| (std::ptr::from_ref(hp) as usize == heap_key).then_some(());
+        sync_heaps_with(only_ours, |(), first, last, step, bytes| {
+            pages += 1;
+            assert!(SHADER_HEAPS.try_lock().is_ok(), "SHADER_HEAPS held during scan");
+            std::thread::spawn(move || { let _ = with_host(heap_key, |_| ()); release_dynamic(heap_key, 0, 0); }).join().unwrap();
+            for (idx, key, view) in host::classify_bytes(&made, first, last, step, bytes) {
+                made[idx as usize] = view.map_or(0, |_| key);
+                updated.push(idx);
+            }
+            assert!(host::classify_bytes(&made, first, last, step, bytes).is_empty());
+        });
+        assert_eq!((pages, updated.as_slice()), (2, &targets[..]));
+        sync_heaps_with(only_ours, |_, _, _, _, _| panic!("clean heap had dirty pages"));
+        sync_heaps();
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        crate::watch::tests::free(memory);
+    }
+
+    /// Partial 4 KiB `MEM_DECOMMIT` holes inside a dirty 64 KiB page and
+    /// unaligned placed heaps whose trailing slot straddles an unmapped page
+    /// boundary must never fault and still mirror every readable slot.
+    #[cfg(windows)]
+    #[test]
+    fn sync_heaps_handles_partial_4k_decommit_and_unaligned_straddle() {
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+        // Case 1: partial 4 KiB decommit inside a 64 KiB heap page.
+        let memory = crate::watch::tests::pool(1);
+        let per_page = (crate::watch::PAGE / 32) as u32;
+        let mut h = std::ptr::null();
+        let desc = HeapDesc { kind: VIEWS_KIND, count: per_page, flags: SHADER_VISIBLE, nodes: 1 };
+        assert_eq!(create(desc, Placement { address: memory as u64, size: u64::from(per_page) * 32 }, &mut h), S_OK);
+        let (heap_key, mut rec) = (h as usize, [0u64; 4]);
+        create_cbv(std::ptr::null(), &[0x3000, 0, 256, 0], rec.as_mut_ptr() as u64);
+        let targets = [3u32, 261]; // OS page 0 and OS page 2
+        for slot_i in targets {
+            // SAFETY: committed 64 KiB pool bytes.
+            unsafe { std::ptr::copy_nonoverlapping(rec.as_ptr().cast(), (memory as u64 + u64::from(slot_i) * 32) as *mut u8, 32) };
+        }
+        // Decommit OS page 1 (`memory + 4096 .. memory + 8192`) inside the dirty 64 KiB page.
+        // SAFETY: decommitting one 4 KiB page of our own pool allocation.
+        assert_ne!(unsafe { VirtualFree((memory + 4096) as *mut _, 4096, MEM_DECOMMIT) }, 0);
+        let (mut made, mut updated) = (vec![0u64; per_page as usize], Vec::new());
+        let only_ours = |hp: &Heap| (std::ptr::from_ref(hp) as usize == heap_key).then_some(());
+        sync_heaps_with(only_ours, |(), first, last, step, bytes| {
+            for (idx, key, view) in host::classify_bytes(&made, first, last, step, bytes) {
+                made[idx as usize] = view.map_or(0, |_| key);
+                updated.push(idx);
+            }
+        });
+        assert_eq!(updated, targets);
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        crate::watch::tests::free(memory);
+
+        // Case 2: unaligned placed heap (`start = base + 24, step = 32`) whose
+        // final slot header straddles the 64 KiB boundary into decommitted memory.
+        let memory = crate::watch::tests::pool(2);
+        let start = memory as u64 + 24;
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, Placement { address: start, size: u64::from(per_page) * 32 }, &mut h), S_OK);
+        let heap_key = h as usize;
+        // SAFETY: slot 5 lies inside committed page 0 of our 2-page pool.
+        unsafe { std::ptr::copy_nonoverlapping(rec.as_ptr().cast(), (start + 5 * 32) as *mut u8, 32) };
+        // Decommit the entire second 64 KiB page so slot 2047 (`base + 65528..65540`) straddles into unmapped memory.
+        // SAFETY: decommitting page 1 of our own 2-page pool allocation.
+        assert_ne!(unsafe { VirtualFree((memory + crate::watch::PAGE) as *mut _, crate::watch::PAGE, MEM_DECOMMIT) }, 0);
+        let (mut made, mut updated) = (vec![0u64; per_page as usize], Vec::new());
+        let only_ours = |hp: &Heap| (std::ptr::from_ref(hp) as usize == heap_key).then_some(());
+        sync_heaps_with(only_ours, |(), first, last, step, bytes| {
+            for (idx, key, view) in host::classify_bytes(&made, first, last, step, bytes) {
+                made[idx as usize] = view.map_or(0, |_| key);
+                updated.push(idx);
+            }
+        });
+        assert_eq!(updated, [5]);
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        crate::watch::tests::free(memory);
+    }
+
+    /// Dropping a heap while `sync_heaps_with` is mid-scan flips `alive` to
+    /// `false` and aborts syncing subsequent pages.
+    #[cfg(windows)]
+    #[test]
+    fn sync_heaps_aborts_when_heap_drops_concurrently() {
+        let (memory, per_page) = (crate::watch::tests::pool(2), (crate::watch::PAGE / 32) as u32);
+        let (count, mut h) = (per_page * 2, std::ptr::null());
+        let desc = HeapDesc { kind: VIEWS_KIND, count, flags: SHADER_VISIBLE, nodes: 1 };
+        assert_eq!(create(desc, Placement { address: memory as u64, size: u64::from(count) * 32 }, &mut h), S_OK);
+        let heap_key = h as usize;
+        let mut rec = [0u64; 4];
+        create_cbv(std::ptr::null(), &[0x4000, 0, 256, 0], rec.as_mut_ptr() as u64);
+        for slot_i in [1u32, per_page + 1] {
+            // SAFETY: inside our 2-page pool allocation.
+            unsafe { std::ptr::copy_nonoverlapping(rec.as_ptr().cast(), (memory as u64 + u64::from(slot_i) * 32) as *mut u8, 32) };
+        }
+        let mut pages = 0usize;
+        let only_ours = |hp: &Heap| (std::ptr::from_ref(hp) as usize == heap_key).then_some(());
+        sync_heaps_with(only_ours, |(), _, _, _, _| {
+            pages += 1;
+            if pages == 1 {
+                // Release the heap while scanning page 0; page 1 must be skipped.
+                slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+            }
+        });
+        assert_eq!(pages, 1, "remaining pages skipped after Heap::drop()");
         crate::watch::tests::free(memory);
     }
 
